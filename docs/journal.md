@@ -20,3 +20,9 @@
 - **Action:** Scaled training from 250k to 2M tokens, 3 epochs. Wired in `src/utils/evaluate.py` for Validation Perplexity measurement using a 50k token held-out split.
 - **Outcome:** Loss progression: 4.11 → 3.38 → 2.93. Validation Perplexity: **14.05**. La Pulga now generates grammatically correct and contextually coherent children's stories. 🏆
 - **Next steps:** Await H100 credits (~2 days). In the meantime: experiment with LR scheduling (cosine decay + warmup) and gradient clipping to push perplexity into single digits on M4.
+
+## 2026-03-21 16:39 (Infrastructure Migration — PyTorch/CUDA RTX 3090)
+- **Goal:** Migrate from Apple Silicon/MLX to WSL2 + RTX 3090 + PyTorch. Make the local environment identical to the H100 target.
+- **Action:** Full rewrite of `src/model/` (`mlx_backend.py` → `transformer.py`), `src/training/loop.py`, `src/data/loader.py`, `src/utils/evaluate.py`, `src/utils/generate.py`, and `main.py`. Added `torch.cuda.amp` (GradScaler + autocast), global `DEVICE` auto-detection, and proper `_init_weights()`. Batch size increased 8 → 256. Updated `pyproject.toml` for `uv` + PyTorch deps. Spec compliance tests rewritten with new `test_model_moves_to_gpu` gate.
+- **Outcome:** Model trains and saves correctly at **14.90 MiB**. However, first run exposed a critical initialization bug: PyTorch `nn.Embedding` defaults to N(0,1) whereas MLX used N(0, 1/√dim), causing logits 16× too large → initial loss ~82 instead of expected ~9.01. Fixed via explicit `_init_weights()` using std=0.02 (nanoGPT standard) with residual projection scaling.
+- **Next steps:** Re-run training with corrected init to confirm perplexity recovers to MLX baseline (~14).

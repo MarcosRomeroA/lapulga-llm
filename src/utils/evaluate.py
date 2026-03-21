@@ -4,15 +4,16 @@ Measures how well the model predicts the next token on unseen validation data.
 Lower perplexity = better model quality.
 """
 import math
-import mlx.core as mx
-import mlx.nn as nn
-from src.model.mlx_backend import LanguageModel
+import torch
+import torch.nn.functional as F
+from src.model.transformer import LanguageModel, DEVICE
 from src.data.loader import get_batches
 
 
+@torch.no_grad()
 def compute_perplexity(
     model: LanguageModel,
-    val_tokens: mx.array,
+    val_tokens: torch.Tensor,
     batch_size: int = 8,
     context_length: int = 256,
 ) -> float:
@@ -24,20 +25,19 @@ def compute_perplexity(
     the model is "confused" between on average. A perplexity of 1.0 means perfect
     prediction. For the Parameter Golf challenge, lower perplexity = higher score.
     """
+    model.eval()
     total_loss: float = 0.0
     total_batches: int = 0
 
-    for batch_inputs, batch_targets in get_batches(val_tokens, batch_size, context_length):
-        logits: mx.array = model(batch_inputs)
+    for batch_inputs, batch_targets in get_batches(val_tokens, batch_size, context_length, device=DEVICE):
+        logits = model(batch_inputs)
+        logits_fp32 = logits.float()
 
-        # Upcast to FP32 for stable softmax (same fix as training)
-        logits_fp32: mx.array = logits.astype(mx.float32)
-
-        loss: mx.array = nn.losses.cross_entropy(
+        loss = F.cross_entropy(
             logits_fp32.reshape(-1, logits.shape[-1]),
             batch_targets.reshape(-1),
         )
-        batch_loss: float = mx.mean(loss).item()
+        batch_loss: float = loss.item()
 
         if not math.isnan(batch_loss):
             total_loss += batch_loss

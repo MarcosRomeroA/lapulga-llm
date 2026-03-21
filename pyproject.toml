@@ -1,14 +1,14 @@
 [project]
-name = "16mb-model"
-version = "0.1.0"
-description = "Add your description here"
+name = "lapulga-llm"
+version = "0.2.0"
+description = "La Pulga: A tiny but fierce decoder-only Transformer for the 16MB Parameter Golf challenge."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "datasets>=4.5.0",
-    "mlx>=0.29.3",
-    "tiktoken>=0.12.0",
+    "torch>=2.1.0",
     "tokenizers>=0.22.2",
+    "safetensors>=0.4.0",
 ]
 
 [dependency-groups]
@@ -16,3 +16,6 @@ dev = [
     "pytest>=8.4.2",
     "pyyaml>=6.0.3",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

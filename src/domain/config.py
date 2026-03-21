@@ -14,15 +14,17 @@ class ModelConfig:
     hidden_dim: int = 1024
     vocab_size: int = 8192
     norm_eps: float = 1e-5
+    context_length: int = 256
+
 
 @dataclass(frozen=True)
 class TrainingConfig:
     """Configuration schema for the training orchestration."""
-    batch_size: int = 8
+    batch_size: int = 256
     context_length: int = 256
     learning_rate: float = 3e-4
     epochs: int = 3
     train_tokens: int = 2_000_000
     val_tokens: int = 50_000
-    checkpoint_path: str = "lapulga_weights.safetensors"
+    checkpoint_path: str = "lapulga_weights.pt"
     tokenizer_path: str = "tokenizer.json"

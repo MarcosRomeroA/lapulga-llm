@@ -3,11 +3,13 @@ Generation Use Case (Inference).
 Implements the autoregressive loop to make La Pulga dream and generate text.
 Uses La Pulga's custom BPE tokenizer for encode/decode.
 """
-import mlx.core as mx
+import torch
+import torch.nn.functional as F
 from tokenizers import Tokenizer
-from src.model.mlx_backend import LanguageModel
+from src.model.transformer import LanguageModel
 
 
+@torch.no_grad()
 def generate_text(
     model: LanguageModel,
     tokenizer: Tokenizer,
@@ -19,33 +21,26 @@ def generate_text(
     Takes a string prompt, tokenizes it, and iteratively predicts the next tokens.
     Iterates autoregressively by appending the newly generated token back to the context.
     """
-    # 1. Tokenize input using our custom BPE (all IDs guaranteed in range)
-    input_ids: list[int] = tokenizer.encode(prompt).ids
+    model.eval()
+    device = model.device
 
+    input_ids: list[int] = tokenizer.encode(prompt).ids
     print(f"Thinking with temperature {temperature}...")
 
-    # 2. Generation Loop (Autoregressive)
     for _ in range(max_tokens):
-        # Prepare context tensor [Batch=1, SequenceLength=N]
-        input_tensor: mx.array = mx.array([input_ids])
+        input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
 
-        # Forward pass through all layers
-        logits: mx.array = model(input_tensor)
+        logits = model(input_tensor)
+        next_token_logits = logits[0, -1, :]
 
-        # Take the logits of the absolute last token generated in the sequence
-        next_token_logits: mx.array = logits[0, -1, :]
-
-        # 3. Sampling filter (Temperature logic)
         if temperature > 0:
-            scaled_logits: mx.array = next_token_logits / temperature
-            next_token_id: int = mx.random.categorical(scaled_logits).item()
+            scaled_logits = next_token_logits / temperature
+            probs = F.softmax(scaled_logits, dim=-1)
+            next_token_id: int = torch.multinomial(probs, num_samples=1).item()
         else:
-            # Greedy search (always pick the highest score)
-            next_token_id: int = mx.argmax(next_token_logits).item()
+            next_token_id: int = torch.argmax(next_token_logits).item()
 
-        # 4. Append to the sequence
         input_ids.append(next_token_id)
 
-    # 5. Decode back to human language
     generated_story: str = tokenizer.decode(input_ids)
     return generated_story

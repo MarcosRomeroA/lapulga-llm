@@ -8,10 +8,9 @@ import re
 import unittest
 from pathlib import Path
 
-import mlx.utils as mlx_utils
+import torch
 import yaml
 
-# The project root is two levels up from this file (tests/)
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 SPEC_PATH: Path = PROJECT_ROOT / "SPEC.md"
 
@@ -43,7 +42,7 @@ class TestSpecCompliance(unittest.TestCase):
         sys.path.insert(0, str(PROJECT_ROOT))
 
         from src.domain.config import ModelConfig
-        from src.model.mlx_backend import LanguageModel
+        from src.model.transformer import LanguageModel
 
         cls.model_config = ModelConfig(
             dim=cls.spec["n_embd"],
@@ -52,13 +51,13 @@ class TestSpecCompliance(unittest.TestCase):
             n_kv_heads=cls.spec["n_kv_heads"],
             hidden_dim=cls.spec["hidden_dim"],
             vocab_size=cls.spec["vocab_size"],
+            context_length=cls.spec["context_length"],
         )
         cls.model = LanguageModel(cls.model_config)
 
-        flat_params = mlx_utils.tree_flatten(cls.model.parameters())
-        cls.total_params: int = sum(arr.size for _, arr in flat_params)
+        cls.total_params: int = sum(p.numel() for p in cls.model.parameters())
 
-    # ── Architectural Shape Tests ───────────────────────────────────────────
+    # -- Architectural Shape Tests --
 
     def test_n_layers_matches_spec(self) -> None:
         """Verify that the number of Transformer blocks matches SPEC.md."""
@@ -102,7 +101,7 @@ class TestSpecCompliance(unittest.TestCase):
                 f"model has {actual_heads}, SPEC requires {expected_heads}",
             )
 
-    # ── Parameter Budget Tests ──────────────────────────────────────────────
+    # -- Parameter Budget Tests --
 
     def test_param_count_within_tolerance(self) -> None:
         """
@@ -121,15 +120,17 @@ class TestSpecCompliance(unittest.TestCase):
             f"(max allowed: {max_allowed:,})",
         )
 
-    # ── Artifact Size Tests ─────────────────────────────────────────────────
+    # -- Artifact Size Tests --
 
     def test_fp16_artifact_within_16mib(self) -> None:
         """
-        Simulates FP16 export: total_params × 2 bytes must stay under max_size_mib.
+        Simulates FP16 export: total_params x 2 bytes must stay under max_size_mib.
         This is the hard constraint set by the Parameter Golf challenge rules.
+        Uses PyTorch state_dict param count for accurate sizing.
         """
         max_size_mib: float = self.spec["constraints"]["max_size_mib"]
-        fp16_bytes: int = self.total_params * 2  # 2 bytes per FP16 float
+        state_dict_params: int = sum(v.numel() for v in self.model.state_dict().values())
+        fp16_bytes: int = state_dict_params * 2
         fp16_mib: float = fp16_bytes / (1024 * 1024)
 
         self.assertLess(
@@ -140,11 +141,11 @@ class TestSpecCompliance(unittest.TestCase):
 
     def test_int4_quantization_headroom(self) -> None:
         """
-        Simulates 4-bit quantization: total_params × 0.5 bytes.
-        We must fit under 16 MiB with significant headroom for INT4 experiments.
+        Simulates 4-bit quantization: total_params x 0.5 bytes.
+        Recalculated: (Params x 4 bytes FP32) budget, then simulated at 0.5 bytes for INT4.
         """
         max_size_mib: float = self.spec["constraints"]["max_size_mib"]
-        int4_bytes: int = self.total_params // 2  # 0.5 bytes per INT4 nibble
+        int4_bytes: int = self.total_params // 2
         int4_mib: float = int4_bytes / (1024 * 1024)
 
         self.assertLess(
@@ -152,9 +153,25 @@ class TestSpecCompliance(unittest.TestCase):
             max_size_mib,
             f"INT4 artifact size {int4_mib:.2f} MiB exceeds the {max_size_mib} MiB limit",
         )
-        # Also report the headroom available for parameter scaling
         headroom_mib: float = max_size_mib - int4_mib
         print(f"\n[INT4] Size: {int4_mib:.2f} MiB | Headroom: {headroom_mib:.2f} MiB")
+
+    # -- Device Tests --
+
+    def test_model_moves_to_gpu(self) -> None:
+        """
+        Verify that the model can be placed on CUDA when available.
+        On CI without GPU, this test verifies it stays on CPU gracefully.
+        """
+        from src.model.transformer import DEVICE
+        test_model = self.model.to(DEVICE)
+        self.assertEqual(
+            test_model.device.type,
+            DEVICE.type,
+            f"Model device is {test_model.device.type}, expected {DEVICE.type}",
+        )
+        # Move back to CPU to not affect other tests
+        self.model.to("cpu")
 
 
 if __name__ == "__main__":

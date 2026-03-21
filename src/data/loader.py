@@ -1,9 +1,9 @@
 """
 Data loading and tokenization interfaces.
-Abstracts the processing of raw text into framework-specific tensors.
+Abstracts the processing of raw text into PyTorch tensors.
 Uses La Pulga's custom BPE tokenizer (trained on TinyStories).
 """
-import mlx.core as mx
+import torch
 from tokenizers import Tokenizer
 from typing import Generator, Tuple, Iterable
 
@@ -17,7 +17,7 @@ def tokenize_stream(
     text_stream: Iterable[str],
     tokenizer: Tokenizer,
     target_tokens: int = 250_000,
-) -> mx.array:
+) -> torch.Tensor:
     """
     Consumes a stream of raw text and tokenizes via our custom BPE.
     No more clamping needed since every token ID is already in range [0, 8191].
@@ -31,24 +31,30 @@ def tokenize_stream(
         if len(tokens) >= target_tokens:
             break
 
-    return mx.array(tokens[:target_tokens])
+    return torch.tensor(tokens[:target_tokens], dtype=torch.long)
 
 
 def get_batches(
-    tokens: mx.array,
+    tokens: torch.Tensor,
     batch_size: int,
     context_length: int,
-) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    device: torch.device = torch.device("cpu"),
+) -> Generator[Tuple[torch.Tensor, torch.Tensor], None, None]:
     """
     Yields (inputs, targets) tensors for autoregressive training.
+    Transfers each batch to the specified device (GPU) on the fly.
     """
-    n_batches: int = len(tokens) // (batch_size * context_length)
-    if n_batches == 0:
-        n_batches = 1
+    # Clamp batch_size to the number of full sequences available in this token set.
+    # This prevents reshape errors when val_tokens < batch_size * context_length.
+    n_full_sequences: int = (len(tokens) - 1) // context_length
+    effective_batch_size: int = min(batch_size, max(1, n_full_sequences))
 
-    tokens = tokens[: n_batches * batch_size * context_length + 1]
-    input_tensors: mx.array = tokens[:-1].reshape(batch_size, -1)
-    target_tokens_arr: mx.array = tokens[1:].reshape(batch_size, -1)
+    n_batches: int = max(1, n_full_sequences // effective_batch_size)
+    tokens = tokens[: n_batches * effective_batch_size * context_length + 1]
+    input_tensors = tokens[:-1].reshape(effective_batch_size, -1)
+    target_tokens_arr = tokens[1:].reshape(effective_batch_size, -1)
 
     for i in range(0, input_tensors.shape[1], context_length):
-        yield input_tensors[:, i : i + context_length], target_tokens_arr[:, i : i + context_length]
+        inputs = input_tensors[:, i : i + context_length].to(device)
+        targets = target_tokens_arr[:, i : i + context_length].to(device)
+        yield inputs, targets
