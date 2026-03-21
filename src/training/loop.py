@@ -39,6 +39,11 @@ def execute_training(model: LanguageModel, tokens: mx.array, train_config: Train
                 
     # Model Export
     print(f"--- 💾 Saving Model Weights ---")
+    # 🚨 CRITICAL FIX: Cast to Float16 ONLY right before saving. 
+    # This keeps AdamW optimizers and gradients in mathematically stable FP32 during the loop!
+    import mlx.utils as utils
+    model.update(utils.tree_map(lambda arr: arr.astype(mx.float16), model.parameters()))
+    
     model.save_weights(train_config.checkpoint_path)
     actual_size_bytes = os.path.getsize(train_config.checkpoint_path)
     print(f"Model saved to {train_config.checkpoint_path}")

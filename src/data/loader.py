@@ -4,16 +4,24 @@ Abstracts the processing of raw text into framework-specific tensors.
 """
 import tiktoken
 import mlx.core as mx
-from typing import Generator, Tuple
+from typing import Generator, Tuple, Iterable
 
-def tokenize_text(text: str, vocab_size: int) -> mx.array:
+def tokenize_stream(text_stream: Iterable[str], vocab_size: int, target_tokens: int = 250_000) -> mx.array:
     """
-    Tokenizes raw text using BPE, clamping to the restricted vocab limit.
+    Consumes a stream of raw text, tokenizes via BPE, and clamps to vocab limit.
+    Stops dynamically when target_tokens count is reached to respect the 10-minute training wall.
     """
     enc = tiktoken.get_encoding("cl100k_base")
-    # Clamp tokens to prevent Out-Of-Bounds indexing in the restricted embedding matrix
-    encoded_list: list[int] = [t if t < vocab_size else 0 for t in enc.encode(text)]
-    return mx.array(encoded_list)
+    tokens: list[int] = []
+    
+    for text in text_stream:
+        # Clamp tokens to prevent Out-Of-Bounds indexing in the architecture matrix
+        encoded: list[int] = [t if t < vocab_size else 0 for t in enc.encode(text)]
+        tokens.extend(encoded)
+        if len(tokens) >= target_tokens:
+            break
+            
+    return mx.array(tokens[:target_tokens])
 
 def get_batches(
     tokens: mx.array, 

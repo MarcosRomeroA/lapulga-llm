@@ -6,18 +6,10 @@ import mlx.core as mx
 import mlx.utils as utils
 from src.domain.config import ModelConfig, TrainingConfig
 from src.model.mlx_backend import LanguageModel
-from src.data.loader import tokenize_text
+from src.data.dataset import fetch_tinystories_stream
+from src.data.loader import tokenize_stream
 from src.training.loop import execute_training
-
-def _create_fallback_data() -> str:
-    """Returns fallback text if no dataset is found locally."""
-    fallback_string: str = "La Pulga is small but exceptionally high-performing. " * 500
-    try:
-        with open("train.txt", "r", encoding="utf-8") as file:
-            return file.read()
-    except FileNotFoundError:
-        print("Warning: train.txt not found. Utilizing fallback generated text.")
-        return fallback_string
+from src.utils.generate import generate_text
 
 def main() -> None:
     """Main execution block."""
@@ -27,20 +19,28 @@ def main() -> None:
 
     # 2. Framework Backend Setup
     mlx_model = LanguageModel(model_config)
-    
-    # Cast entirely to float16 to honor the 16MB constraint.
-    # We update the model state recursively with the new typed tensors.
-    mlx_model.update(utils.tree_map(lambda arr: arr.astype(mx.float16), mlx_model.parameters()))
-    
     num_params: int = sum(v.size for _, v in utils.tree_flatten(mlx_model.parameters()))
     print(f"Model Parameters: {num_params:,}")
 
-    # 3. Data Interface Setup
-    raw_text: str = _create_fallback_data()
-    tokens: mx.array = tokenize_text(raw_text, model_config.vocab_size)
+    # 3. Data Interface Setup (Clean Architecture Streaming)
+    print("--- 📥 Streaming TinyStories from HuggingFace ---")
+    data_stream = fetch_tinystories_stream(split="train")
+    
+    # Cap to 250k tokens for local fast iteration
+    tokens: mx.array = tokenize_stream(data_stream, model_config.vocab_size, target_tokens=250_000)
+    print(f"Loaded {len(tokens):,} tokens for training.")
 
     # 4. Use Case Orchestrator Execution
     execute_training(model=mlx_model, tokens=tokens, train_config=train_config)
+
+    # 5. Evaluation / Text Generation
+    print("\n--- 🗣️ Evaluating La Pulga ---")
+    test_prompt: str = "Once upon a time, there was a little dog"
+    output_text: str = generate_text(mlx_model, test_prompt, max_tokens=40, temperature=0.7)
+    
+    print("-" * 40)
+    print(f"Output:\n\n{output_text}")
+    print("-" * 40)
 
 if __name__ == "__main__":
     main()

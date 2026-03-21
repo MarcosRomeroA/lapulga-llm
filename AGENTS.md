@@ -42,6 +42,7 @@ The project must follow a structured documentation approach in a `/docs` folder 
 - **`glossary.md`**: Definitions of key technical terms (Quantization, GQA, MQA, Perplexity, etc.).
 
 ## 🤖 Instructions for the Agent
+- **Execution Policy:** DO NOT run terminal commands directly unless explicitly requested by the user for debugging purposes. Treat the user as the principal operator and provide them the clean command instructions to run manually.
 - **Architecture Strictness:** You must ALWAYS follow the standards defined in `ARCHITECTURE.md`. You are instructed to actively reject any monolithic, non-typed, or poorly named code suggestions.
 - **Priority:** Learning & Transparency.
 - **Code Suggestions:** Every code suggestion must include a "Why it works" section and a weight calculation.

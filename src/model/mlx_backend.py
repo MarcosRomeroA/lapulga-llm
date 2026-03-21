@@ -112,5 +112,10 @@ class LanguageModel(nn.Module):
 def cross_entropy_loss(model: LanguageModel, input_tensors: mx.array, target_tokens: mx.array) -> mx.array:
     """Calculates cross entropy loss for autoregressive training."""
     logits: mx.array = model(input_tensors)
-    loss: mx.array = nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), target_tokens.reshape(-1))
+    
+    # 🚨 CRITICAL FP16 FIX: We must step the logits back to Float32 before Softmax 
+    # to avoid exploding exponentiations that cause 'NaN' loss in constrained MLX arrays
+    logits_fp32: mx.array = logits.astype(mx.float32)
+    
+    loss: mx.array = nn.losses.cross_entropy(logits_fp32.reshape(-1, logits.shape[-1]), target_tokens.reshape(-1))
     return mx.mean(loss)
