@@ -32,3 +32,31 @@ Beyond just writing readable syntax, the project strictly enforces **Clean Archi
 
 ---
 **🤖 Agent Directive:** The AI assistant (*Antigravity*) acting on this repository is strictly commanded to **evaluate and reject** any code suggestion or draft that fails to adhere to these modular, type-hinted, and clean-code standards. All future code must be refactored to align with this file before being proposed.
+
+---
+
+## ✅ Validation Pipeline (Spec-Driven Development)
+
+All architectural decisions are encoded in **`SPEC.md`**, which serves as the machine-readable single source of truth. The compliance gate is enforced via:
+
+```bash
+uv run pytest tests/test_spec_compliance.py -v
+```
+
+### Gate Rules — No PR or code change that touches `src/model/` or `src/domain/config.py` is accepted unless ALL of the following pass:
+
+| Test | What it validates |
+|:---|:---|
+| `test_n_layers_matches_spec` | Transformer block count == `SPEC.n_layers` |
+| `test_embedding_dim_matches_spec` | Embedding dim == `SPEC.n_embd` |
+| `test_vocab_size_matches_spec` | Vocab size == `SPEC.vocab_size` |
+| `test_attention_heads_match_spec` | Query heads == `SPEC.n_head` in every layer |
+| `test_param_count_within_tolerance` | Total params ≤ `target_params` × (1 + 1%) |
+| `test_fp16_artifact_within_16mib` | `total_params × 2` bytes < 16 MiB |
+| `test_int4_quantization_headroom` | `total_params × 0.5` bytes < 16 MiB |
+
+### SDD Workflow
+1. **Edit `SPEC.md` first.** The YAML block is the contract.
+2. **Update `src/domain/config.py`** to reflect the new spec values.
+3. **Run the compliance suite.** If it fails, the architecture change is rejected.
+4. **Commit only when green.**
