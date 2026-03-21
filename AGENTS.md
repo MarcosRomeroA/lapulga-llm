@@ -20,6 +20,9 @@ Total capacity based on weight precision:
 - **4-bit (int4):** ~33.5M parameters (**Priority strategy**).
 
 ## 📋 Architectural Guidelines for AI Agents
+🚨 **CRITICAL DIRECTIVE:** The AI Agent **MUST** read and strictly adhere to the technical and coding standards defined in **`ARCHITECTURE.md`**. This establishes the absolute laws for modular structure, enforcing clean code (SRP, PEP8), mandatory Type Hinting, and the "La Pulga" philosophy. 
+
+*Baseline Parameters:*
 1. **Vocabulary Size:** Keep it small (e.g., 8k to 16k tokens) to prevent the embedding matrix from consuming too much of the 16MB budget.
 2. **Attention:** Use **Grouped-Query Attention (GQA)** or **Multi-Query Attention (MQA)** to reduce memory footprint and increase inference/training speed.
 3. **Layer Depth:** Experiment with 6-12 layers. Prioritize "width" (embedding dimension) over "depth" if perplexity plateaus.
@@ -39,6 +42,7 @@ The project must follow a structured documentation approach in a `/docs` folder 
 - **`glossary.md`**: Definitions of key technical terms (Quantization, GQA, MQA, Perplexity, etc.).
 
 ## 🤖 Instructions for the Agent
+- **Architecture Strictness:** You must ALWAYS follow the standards defined in `ARCHITECTURE.md`. You are instructed to actively reject any monolithic, non-typed, or poorly named code suggestions.
 - **Priority:** Learning & Transparency.
 - **Code Suggestions:** Every code suggestion must include a "Why it works" section and a weight calculation.
 - Whenever proposing architectural changes, **always calculate the estimated file size** in bytes.
