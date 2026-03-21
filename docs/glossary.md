@@ -11,3 +11,19 @@
 - **Attention Heads (H) & KV Heads:** The number of parallel attention mechanisms. In GQA, we use fewer Key/Value (KV) heads than Query heads to drastically reduce the size of the attention weight matrices.
 - **MLP Hidden Size:** The expanded dimension inner layer of the Feed-Forward network (typically a multiple of D, like 4*D). It is where the "knowledge" of the model is stored, but it is very parameter-heavy.
 - **LLM (Large Language Model):** The specific architecture of La Pulga.
+
+- **BPE (Byte-Pair Encoding):** The tokenization algorithm that builds a shared vocabulary by iteratively merging the most frequent adjacent byte/character pairs in a corpus. A *custom-trained* BPE on the target dataset (e.g., TinyStories) is critical: using a pre-trained tokenizer (like tiktoken's cl100k_base) with a reduced vocab causes massive token corruption because any out-of-range token maps to a single fallback ID.
+
+- **Mixed Precision Training:** The strategy of training in high-precision (FP32) for numerical stability while exporting the final weights in low-precision (FP16 or INT4) to meet an artifact size constraint. The key insight: casting to FP16 *before* training causes AdamW's second-moment accumulators to overflow (max FP16 ≈ 65,504), leading to NaN loss within ~10 batches.
+
+- **Autoregressive Generation:** The inference loop where the model generates one token at a time, and each newly generated token is appended to the input context to predict the next token. This creates a feedback loop: each prediction depends on all previous predictions.
+
+- **Temperature (sampling):** A scalar applied to the logits before sampling the next token. `T > 1` flattens the distribution (more random, creative output). `T < 1` sharpens it (more deterministic, repetitive output). `T = 0` becomes greedy search (always picks the top-1 token).
+
+- **KV Cache:** An optimization for autoregressive inference that caches the Key and Value tensors computed for all previous tokens in the Attention layer. Without it, every new token requires recomputing attention over the full context from scratch, making generation O(n²) in sequence length.
+
+- **Epoch:** One complete pass of the training loop over the entire dataset. Multiple epochs allow the model to revisit and reinforce patterns. Trade-off: too many epochs leads to memorization (overfitting) rather than generalization.
+
+- **Validation Perplexity:** Perplexity measured on a held-out set the model has never seen during training. This is the definitive quality score reported in the Parameter Golf leaderboard format — not train loss. Lower is better.
+
+- **Weight Tying:** The technique of sharing the same weight matrix between the input Embedding layer and the output projection (logit) layer. Since both map between the same token space and vector space, tying them cuts ~2M parameters from the budget and often improves training stability.

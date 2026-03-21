@@ -20,6 +20,9 @@ class TrainingConfig:
     """Configuration schema for the training orchestration."""
     batch_size: int = 8
     context_length: int = 256
-    learning_rate: float = 3e-4  # Lowered from 1e-3 to prevent FP16 NaN explosions
-    epochs: int = 1
+    learning_rate: float = 3e-4
+    epochs: int = 3
+    train_tokens: int = 2_000_000
+    val_tokens: int = 50_000
     checkpoint_path: str = "lapulga_weights.safetensors"
+    tokenizer_path: str = "tokenizer.json"

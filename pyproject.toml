@@ -8,4 +8,5 @@ dependencies = [
     "datasets>=4.5.0",
     "mlx>=0.29.3",
     "tiktoken>=0.12.0",
+    "tokenizers>=0.22.2",
 ]
