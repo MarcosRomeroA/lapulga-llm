@@ -51,3 +51,11 @@
 - **Action:** Scaled from 9L/1024hidden (~17M) to **12L/1536hidden (~28.9M)**. Added warmup+cosine decay LR scheduler (peak 6e-4, 5% warmup). Integrated `torch.compile` for ~25% speedup (~3s/step vs 4s). Implemented `DEV_MODE` env var for fast 100-step validation runs.
 - **Outcome:** DEV_MODE validation passed: no OOM, torch.compile works, scheduler warmup correct, artifact 9.44MB (under 16MB). Ready for full 500M token run (~48 min).
 - **Next steps:** Full training run (`make run`), target BPB ≤ 1.22.
+
+## 2026-03-22 (Full RunPod Run — v4.0)
+- **Goal:** First full 500M token training run on RunPod GPU infrastructure.
+- **Architecture:** 12 effective layers (4 physical × 3 ALBERT-style repeats), D=768, H=12, KV=4, MLP=3072, V=1024 → **25,976,112 params**.
+- **Action:** Full training run on RunPod CUDA. 953 steps, 1 epoch. Batch: 32 accum × 16K micro = 524K tokens/step. Warmup+cosine LR (peak 6e-4, 47 warmup steps). torch.compile enabled. 62M validation tokens.
+- **Outcome:** Loss: 14.09→3.49 (avg 4.45). **Validation BPB: 2.0680**. Step time ~1.57s. Artifact: 9.32MB (under 16MB limit). Text generation coherent. Noted torch.compile recompilation warnings from RoPE `_seq_len_cached` integer attribute.
+- **Issues:** BPB 2.0680 is worse than v2.2 (1.7429 with 17M params / 200M tokens / 3 epochs). Likely causes: only 1 epoch vs 3, ALBERT weight-sharing may limit effective capacity, LR may be too aggressive for shared weights.
+- **Next steps:** Investigate 3-epoch run, tune LR for ALBERT-style architecture, fix RoPE recompilation (use `allow_unspec_int_on_nn_module` or tensor-ify `_seq_len_cached`).
