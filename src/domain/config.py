@@ -13,7 +13,7 @@ class ModelConfig:
     repeat_count: int = 3
     n_heads: int = 12
     n_kv_heads: int = 4
-    hidden_dim: int = 3072
+    hidden_dim: int = 3584
     vocab_size: int = 1024
     norm_eps: float = 1e-5
     context_length: int = 1024
@@ -29,7 +29,7 @@ class ModelConfig:
 class TrainingConfig:
     """Configuration schema for the training orchestration."""
     batch_size: int = 524288
-    micro_batch_size: int = 16384
+    micro_batch_size: int = 131072
     context_length: int = 1024
     learning_rate: float = 6e-4
     epochs: int = 1
