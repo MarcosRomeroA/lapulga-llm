@@ -9,6 +9,7 @@ import sentencepiece as spm
 from src.model.transformer import LanguageModel
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def generate_text(
     model: LanguageModel,

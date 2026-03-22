@@ -48,7 +48,8 @@ class TestSpecCompliance(unittest.TestCase):
 
         cls.model_config = ModelConfig(
             dim=cls.spec["n_embd"],
-            n_layers=cls.spec["n_layers"],
+            physical_layers=cls.spec["physical_layers"],
+            repeat_count=cls.spec["repeat_count"],
             n_heads=cls.spec["n_head"],
             n_kv_heads=cls.spec["n_kv_heads"],
             hidden_dim=cls.spec["hidden_dim"],
@@ -63,13 +64,20 @@ class TestSpecCompliance(unittest.TestCase):
     # -- Architectural Shape Tests --
 
     def test_n_layers_matches_spec(self) -> None:
-        """Verify that the number of Transformer blocks matches SPEC.md."""
-        expected_layers: int = self.spec["n_layers"]
-        actual_layers: int = len(self.model.layers)
+        """Verify that physical layer count and effective depth match SPEC.md."""
+        expected_physical: int = self.spec["physical_layers"]
+        expected_effective: int = self.spec["physical_layers"] * self.spec["repeat_count"]
+        actual_physical: int = len(self.model.layers)
+        actual_effective: int = self.model.config.effective_layers
         self.assertEqual(
-            actual_layers,
-            expected_layers,
-            f"Layer count mismatch: model has {actual_layers}, SPEC requires {expected_layers}",
+            actual_physical,
+            expected_physical,
+            f"Physical layer count mismatch: model has {actual_physical}, SPEC requires {expected_physical}",
+        )
+        self.assertEqual(
+            actual_effective,
+            expected_effective,
+            f"Effective layer count mismatch: model has {actual_effective}, SPEC requires {expected_effective}",
         )
 
     def test_embedding_dim_matches_spec(self) -> None:

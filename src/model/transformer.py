@@ -3,7 +3,6 @@ PyTorch Implementation of La Pulga Transformer.
 Aligned with the official OpenAI Parameter-Golf architecture.
 Uses relu^2 MLP, U-Net skip connections, logit softcap, and SDPA.
 """
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,7 +14,7 @@ DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cp
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (parameterless variant)."""
+    """Root Mean Square Layer Normalization."""
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.dim = dim
@@ -89,7 +88,6 @@ class Attention(nn.Module):
         k = self.wk(input_tensor).view(batch_size, seq_length, self.n_kv_heads, self.head_dim).transpose(1, 2)
         v = self.wv(input_tensor).view(batch_size, seq_length, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        # QK-norm for training stability
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
 
@@ -97,10 +95,8 @@ class Attention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # Learnable per-head gain on queries
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        # Flash Attention via SDPA with native GQA support
         output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=None,
@@ -114,11 +110,7 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     """
     ReLU^2 Feed-Forward block (official Parameter-Golf baseline).
-
-    Why relu^2 instead of SwiGLU?
-    SwiGLU uses 3 weight matrices per layer; relu^2 uses only 2.
-    This saves ~33% of MLP parameters, allowing more depth (9 layers)
-    within the 16MB budget. All top Parameter-Golf entries use relu^2.
+    Uses 2 weight matrices vs SwiGLU's 3, saving ~33% MLP parameters.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -134,8 +126,8 @@ class MLP(nn.Module):
 class TransformerBlock(nn.Module):
     """
     Single Transformer layer with learnable attn/mlp scales and residual mixing.
-    The resid_mix parameter blends the current residual (x) with the original
-    embedding (x0) at each layer, improving gradient flow.
+    resid_mix blends the current residual with the original embedding at each pass,
+    which is especially useful under ALBERT-style repetition for gradient flow.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -161,14 +153,16 @@ class TransformerBlock(nn.Module):
 
 class LanguageModel(nn.Module):
     """
-    The complete La Pulga Model architecture in PyTorch.
-    Aligned with the official Parameter-Golf baseline.
+    La Pulga — Fat ALBERT variant for H100.
 
-    Key features:
-    - Weight Tying: tok_embeddings shared as output head
-    - U-Net Skip Connections: encoder layers feed into decoder layers
-    - Logit Softcap: tanh(logits/cap)*cap prevents logit explosion
-    - relu^2 MLP: 2 matrices instead of SwiGLU's 3
+    ALBERT-style Cross-Layer Sharing: 4 physical blocks repeated 3× = 12 effective layers.
+    At dim=768 the H100's 228KB L1 shared memory easily fits fused RMSNorm backward kernels
+    (vs the RTX 3090's 101KB limit which forced dim=512).
+
+    Budget breakdown (stored params ~26M, artifact ~12MB int8+zlib):
+    - 4 physical layers × ~6.3M params/layer = ~25.2M
+    - Embeddings 1024×768 (tied as output head)  = 0.79M
+    - Skip weights 6×768 + final norm             = ~5K
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -178,25 +172,21 @@ class LanguageModel(nn.Module):
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
 
-        # U-Net: split layers into encoder and decoder halves
-        self.num_encoder_layers: int = config.n_layers // 2
-        self.num_decoder_layers: int = config.n_layers - self.num_encoder_layers
-        self.num_skip_weights: int = min(self.num_encoder_layers, self.num_decoder_layers)
+        # U-Net skip connections indexed over effective (virtual) layer depth
+        num_encoder: int = config.effective_layers // 2
+        num_decoder: int = config.effective_layers - num_encoder
+        self.num_skip_weights: int = min(num_encoder, num_decoder)
         self.skip_weights = nn.Parameter(
             torch.ones(self.num_skip_weights, config.dim, dtype=torch.float32)
         )
 
-        self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
+        # Only physical_layers unique blocks stored — shared across repeats
+        self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.physical_layers)])
         self.norm = RMSNorm(config.dim, config.norm_eps)
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """
-        Applies Parameter-Golf weight initialization.
-        - Embedding: N(0, 0.02) for stable initial logits
-        - Residual projections (wo, proj): zero-init for clean residual stream at start
-        """
         nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
@@ -208,23 +198,28 @@ class LanguageModel(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # Encoder half: store skip connections
-        for i in range(self.num_encoder_layers):
-            x = self.layers[i](x, x0)
-            skips.append(x)
+        num_encoder: int = self.config.effective_layers // 2
+        virtual_idx: int = 0
+        decoder_step: int = 0
 
-        # Decoder half: reuse skips in reverse order
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.layers[self.num_encoder_layers + i](x, x0)
+        # ALBERT loop: traverse the 4 physical blocks repeat_count times
+        for _ in range(self.config.repeat_count):
+            for layer in self.layers:
+                if virtual_idx < num_encoder:
+                    x = layer(x, x0)
+                    skips.append(x)
+                else:
+                    if skips:
+                        sw = self.skip_weights[decoder_step].to(dtype=x.dtype)[None, None, :]
+                        x = x + sw * skips.pop()
+                    x = layer(x, x0)
+                    decoder_step += 1
+                virtual_idx += 1
 
         x = self.norm(x)
 
         # Weight Tying: reuse tok_embeddings.weight as the output head
         logits = F.linear(x, self.tok_embeddings.weight)
-
-        # Logit softcap: prevents explosion without gradient clipping
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
 
         if target_ids is not None:
@@ -237,5 +232,4 @@ class LanguageModel(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        """Returns the device of the model parameters."""
         return self.tok_embeddings.weight.device

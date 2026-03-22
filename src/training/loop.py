@@ -10,6 +10,7 @@ import time
 import zlib
 
 import torch
+from safetensors.torch import save_file as safetensors_save
 from src.domain.config import TrainingConfig
 from src.model.transformer import LanguageModel, DEVICE
 from src.data.shard_loader import TokenStream
@@ -26,11 +27,9 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     model.to(DEVICE)
     model.train()
 
-    # torch.compile for faster training
+    # torch.compile disabled: Triton exceeds RTX 3090 shared memory limit
+    # during backward pass compilation of fused RMSNorm kernels.
     compiled_model = model
-    if hasattr(torch, "compile") and DEVICE.type == "cuda":
-        print("--- Compiling model with torch.compile ---")
-        compiled_model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     use_amp: bool = DEVICE.type == "cuda"
@@ -113,18 +112,27 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
         avg_epoch_loss: float = epoch_loss / steps_per_epoch
         print(f"--- Epoch {epoch} complete | Avg Loss: {avg_epoch_loss:.4f} ---")
 
-    # Model Export: int8 quantization + zlib compression (official format)
-    # Use the original model (not compiled) for state_dict
-    print("--- Saving Model (int8 + zlib) ---")
-    obj, stats = quantize_state_dict_int8(model.state_dict())
+    orig_model = getattr(model, '_orig_mod', model)
+    raw_state_dict = orig_model.state_dict()
+
+    # Primary checkpoint: safetensors (safe, portable, no pickle)
+    print("--- Saving Checkpoint (.safetensors) ---")
+    cpu_state_dict = {k: v.cpu().contiguous() for k, v in raw_state_dict.items()}
+    safetensors_save(cpu_state_dict, train_config.checkpoint_path)
+    print(f"Checkpoint saved to {train_config.checkpoint_path}")
+
+    # Submission artifact: int8 quantization + zlib compression (official format)
+    print("--- Building Submission Artifact (int8 + zlib) ---")
+    obj, stats = quantize_state_dict_int8(raw_state_dict)
     buf = io.BytesIO()
     torch.save(obj, buf)
     compressed = zlib.compress(buf.getvalue(), level=9)
 
-    with open(train_config.checkpoint_path, "wb") as f:
+    artifact_path: str = train_config.checkpoint_path.replace(".safetensors", "_submission.pt.zlib")
+    with open(artifact_path, "wb") as f:
         f.write(compressed)
 
     model_bytes: int = len(compressed)
-    print(f"Model saved to {train_config.checkpoint_path}")
+    print(f"Submission artifact saved to {artifact_path}")
     print(f"Int8+zlib size: {model_bytes:,} bytes ({model_bytes / 1_000_000:.2f} MB)")
     print(f"Params quantized: {stats['param_count']:,}")

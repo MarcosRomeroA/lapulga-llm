@@ -3,16 +3,17 @@ model_name: lapulga-llm
 architecture: decoder-only-transformer
 framework: pytorch-2.x
 compute: rtx-3090-cuda-12.1
-n_layers: 12
-n_embd: 512
-n_head: 8
+n_embd: 768
+n_head: 12
 n_kv_heads: 4
-hidden_dim: 1536
+physical_layers: 4
+repeat_count: 3
+hidden_dim: 3072
 vocab_size: 1024
 context_length: 1024
 constraints:
   max_size_bytes: 16000000
-  target_params: 28876384
+  target_params: 25976112
   tolerance_pct: 1.0
 tokenizer: sentencepiece-sp1024
 dataset: fineweb-sp1024
@@ -37,11 +38,13 @@ All code must conform to this specification. Compliance is enforced automaticall
 | `architecture` | Decoder-only Transformer | Generative task: next-token prediction |
 | `framework` | PyTorch 2.x | CUDA-native framework for RTX 3090 / H100 |
 | `compute` | RTX 3090 (CUDA 12.1) | 24 GB VRAM, identical pipeline to H100 target |
-| `n_layers` | 12 | Deeper model for better BPB at ~29M param budget |
-| `n_embd` | 512 | Official baseline width |
-| `n_head` | 8 | Query heads for multi-head attention |
-| `n_kv_heads` | 4 | GQA compression: 2:1 ratio (official baseline) |
-| `hidden_dim` | 1536 | MLP inner size = 3 x n_embd (relu^2, 2 matrices) |
+| `n_embd` | 768 | H100 228KB L1 cache fits fused RMSNorm backward at this width |
+| `n_head` | 12 | Query heads (head_dim = 64) |
+| `n_kv_heads` | 4 | GQA compression: 3:1 ratio |
+| `physical_layers` | 4 | Unique layer blocks stored on disk |
+| `repeat_count` | 3 | Times the block is traversed during forward pass |
+| `effective_layers` | 12 | 4 physical × 3 repeats — effective depth |
+| `hidden_dim` | 3072 | MLP inner size = 4 x n_embd (relu^2, 2 matrices) |
 | `vocab_size` | 1024 | SentencePiece sp1024 — official challenge tokenizer |
 | `context_length` | 1024 | Official training sequence length |
 | `norm_eps` | 1e-5 | RMSNorm stability epsilon |
@@ -50,12 +53,27 @@ All code must conform to this specification. Compliance is enforced automaticall
 | `scoring_metric` | BPB (Bits Per Byte) | Tokenizer-agnostic compression on FineWeb val set |
 | `dataset` | FineWeb (sp1024 shards) | Official challenge dataset |
 
+## Fat ALBERT — Cross-Layer Parameter Sharing on H100
+
+Instead of 12 distinct blocks, La Pulga stores only **4 physical blocks** and routes the forward
+pass through them **3 times**. This is the ALBERT strategy adapted for Parameter Golf.
+
+**Why this works on H100 (not RTX 3090):**
+The H100 has **228 KB of L1 Shared Memory per SM** — more than double the RTX 3090's 101 KB.
+Triton's fused RMSNorm backward kernel at `dim=768` requires ~170 KB, which fits comfortably
+on H100 but caused `OutOfMemoryError` locally.
+
+**Budget math:**
+- 4 stored layers × ~6.3M params = ~25.2M stored params → ~12 MB int8+zlib
+- 12 effective transformer steps maintain full representational depth
+- U-Net skip weights indexed over virtual (effective) layer indices 0–11
+
 ## Constraints
 
 | Constraint | Value |
 |:---|:---|
 | Max artifact size | **16,000,000 bytes** (decimal) = code bytes + zlib(int8 model) |
-| Target parameter count | **28,876,384** (1% tolerance enforced in CI) |
+| Target parameter count | **25,976,112** (1% tolerance enforced in CI) |
 | Target BPB | **1.22** (official baseline: 1.2244) |
 | Max training time | **10 minutes** on 8x H100 |
 | Precision (training) | FP32 with AMP (torch.cuda.amp) |
@@ -64,13 +82,14 @@ All code must conform to this specification. Compliance is enforced automaticall
 
 ## Parameter Budget Breakdown
 
-| Component | Params | Int8 Bytes |
+| Component | Params | Notes |
 |:---|:---|:---|
-| Embeddings (1024 x 512, tied) | 524,288 | ~0.5 MB |
-| Attention x 12 (GQA kv=4) | 9,437,184 | ~9.4 MB |
-| MLP x 12 (relu^2, hidden=1536) | 18,874,368 | ~9.4 MB (after zlib) |
-| RMSNorm x 25 + scales | ~40,544 | ~40 KB (fp16/fp32) |
-| **Total** | **~28,876,384** | **~14.5 MB after zlib** |
+| Embeddings (1024 × 512, tied) | 524,288 | Shared as output head |
+| Attention × 12 (GQA kv=4) | 9,437,184 | wq/wk/wv/wo + q_gain per layer |
+| MLP × 12 (relu^2, hidden=1536) | 18,874,368 | fc + proj per layer |
+| RMSNorm + scales × 12 | ~36,864 | attn_norm, ffn_norm, attn_scale, mlp_scale, resid_mix |
+| Skip weights (6 × 512) | 3,072 | U-Net over 12 layer indices |
+| **Total stored** | **~28.9M** | **~9.5 MB after int8+zlib** |
 
 ## Compliance Gate
 
