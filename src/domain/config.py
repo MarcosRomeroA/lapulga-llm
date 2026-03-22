@@ -29,7 +29,7 @@ class ModelConfig:
 class TrainingConfig:
     """Configuration schema for the training orchestration."""
     batch_size: int = 524288
-    micro_batch_size: int = 131072
+    micro_batch_size: int = 65536
     context_length: int = 1024
     learning_rate: float = 6e-4
     epochs: int = 1
