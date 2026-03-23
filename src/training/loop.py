@@ -69,11 +69,6 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     # ------------------------------------------------------------
     model.to(DEVICE)
     model.bfloat16()
-    # Keep scalar/control params in fp32 for optimizer stability
-    with torch.no_grad():
-        for name, param in model.named_parameters():
-            if param.ndim < 2 and param.dtype != torch.float32:
-                param.data = param.data.float()
     model.train()
 
     print("Compiling model (dynamic=False, fullgraph=True)...")
