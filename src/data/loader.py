@@ -3,11 +3,14 @@ Data loading and tokenization interfaces.
 Abstracts the processing of raw text into PyTorch tensors.
 Uses La Pulga's custom BPE tokenizer (trained on TinyStories).
 """
+import glob
+from pathlib import Path
+
 import torch
-from torch.utils.data import IterableDataset, get_worker_info
 from tokenizers import Tokenizer
 from typing import Generator, Tuple, Iterable
-from src.data.shard_loader import TokenStream, load_data_shard
+
+from src.data.shard_loader import load_data_shard
 
 
 def load_tokenizer(tokenizer_path: str = "tokenizer.json") -> Tokenizer:
@@ -62,38 +65,19 @@ def get_batches(
         yield inputs, targets
 
 
-class FineWebDataset(IterableDataset):
+def preload_train_tokens(shard_pattern: str) -> torch.Tensor:
     """
-    Wraps TokenStream into a PyTorch IterableDataset yielding (x, y) sequences.
-    Safely distributes shard files across multiple DataLoader workers to prevent duplicated data.
+    Pre-loads ALL training shards into a single contiguous CPU tensor.
+    For 500M tokens (~1GB), this fits easily in RAM and eliminates
+    all disk I/O during training, which is critical for small models
+    on fast GPUs like the H100 NVL.
     """
-    def __init__(self, shard_pattern: str, seq_len: int, micro_tokens: int):
-        super().__init__()
-        self.shard_pattern = shard_pattern
-        self.seq_len = seq_len
-        self.micro_tokens = micro_tokens
-        
-    def __iter__(self):
-        worker_info = get_worker_info()
-        stream = TokenStream(self.shard_pattern)
-        
-        if worker_info is not None:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-            
-            # Distribute shards (files) based on worker ID securely
-            worker_files = [f for i, f in enumerate(stream.files) if i % num_workers == worker_id]
-            if not worker_files:
-                worker_files = stream.files  # Fallback
-                
-            stream.files = worker_files
-            stream.file_idx = 0
-            stream.tokens = load_data_shard(stream.files[0])
-            stream.pos = 0
+    files = sorted(glob.glob(shard_pattern))
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {shard_pattern}")
 
-        while True:
-            # Yield pre-batched macro-blocks natively to avoid PyTorch collation overhead
-            chunk = stream.take(self.micro_tokens + 1)
-            x = chunk[:-1].reshape(-1, self.seq_len).to(torch.int64)
-            y = chunk[1:].reshape(-1, self.seq_len).to(torch.int64)
-            yield x, y
+    print(f"Pre-loading {len(files)} training shards into memory...")
+    all_shards = [load_data_shard(Path(f)) for f in files]
+    tokens = torch.cat(all_shards).contiguous().pin_memory()
+    print(f"Loaded {tokens.numel():,} tokens ({tokens.numel() * 2 / 1e9:.2f} GB)")
+    return tokens

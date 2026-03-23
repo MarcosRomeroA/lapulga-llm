@@ -1,6 +1,6 @@
 """
 Training Orchestrator for Lapulga.
-Reads FineWeb shards via TokenStream and trains the model with AMP.
+Pre-loads all training data into RAM, then trains with pure tensor slicing.
 Exports via int8 quantization + zlib compression (official Parameter-Golf format).
 """
 import io
@@ -13,15 +13,15 @@ import torch
 from safetensors.torch import save_file as safetensors_save
 from src.domain.config import TrainingConfig
 from src.model.transformer import LanguageModel, DEVICE
-from src.data.loader import FineWebDataset
-from torch.utils.data import DataLoader
+from src.data.loader import preload_train_tokens
 from src.utils.quantize import quantize_state_dict_int8
 
 
 def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None:
     """
     Executes the main optimization loop on FineWeb shards.
-    Trains in FP32 (with AMP on CUDA), then exports via int8+zlib.
+    All training data is pre-loaded into RAM to eliminate I/O bottlenecks.
+    Trains with AMP on CUDA, then exports via int8+zlib.
     """
     dev_mode: bool = os.environ.get("DEV_MODE", "0") == "1"
 
@@ -40,17 +40,11 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     micro_tokens: int = train_config.micro_batch_size  # tokens per forward pass
     accum_steps: int = max(1, batch_tokens // micro_tokens)
 
-    # Initialize DataLoader with IterableDataset
+    # Pre-load ALL training data into RAM — zero I/O during training
     shard_pattern: str = os.path.join(train_config.data_path, "fineweb_train_*.bin")
-    dataset = FineWebDataset(shard_pattern, seq_len, micro_tokens)
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=None,  # Optimization: dataset natively yields pre-batched matrices
-        num_workers=4,
-        pin_memory=True,
-    )
-    data_iter = iter(dataloader)
+    all_tokens: torch.Tensor = preload_train_tokens(shard_pattern)
+    token_cursor: int = 0
+    total_available: int = all_tokens.numel()
 
     # Calculate steps: train_tokens / batch_tokens * epochs
     steps_per_epoch: int = max(1, train_config.train_tokens // batch_tokens)
@@ -91,14 +85,16 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
             step_loss: float = 0.0
 
             for micro_step in range(accum_steps):
-                try:
-                    x, y = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(dataloader)
-                    x, y = next(data_iter)
+                # Pure tensor slicing from pre-loaded RAM — zero I/O
+                need: int = micro_tokens + 1
+                if token_cursor + need > total_available:
+                    token_cursor = 0  # wrap around
 
-                x = x.to(device=DEVICE, non_blocking=True)
-                y = y.to(device=DEVICE, non_blocking=True)
+                chunk = all_tokens[token_cursor : token_cursor + need]
+                token_cursor += micro_tokens
+
+                x = chunk[:-1].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64, non_blocking=True)
+                y = chunk[1:].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64, non_blocking=True)
 
                 with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                     loss_val = compiled_model(x, y)
