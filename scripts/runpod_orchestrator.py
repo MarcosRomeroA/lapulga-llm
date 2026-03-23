@@ -44,7 +44,26 @@ def log(msg: str) -> None:
 # Step 1: Start Pod
 # ---------------------------------------------------------------------------
 log(f"Resuming pod {POD_ID}...")
-runpod.resume_pod(pod_id=POD_ID, gpu_count=1)
+try:
+    runpod.resume_pod(pod_id=POD_ID, gpu_count=1)
+except runpod.error.QueryError as e:
+    if "spot pod" in str(e).lower():
+        log("Spot pod detected. Using podBidResume via GraphQL...")
+        from runpod.api.graphql import run_graphql_query
+        pod_info = runpod.get_pod(POD_ID)
+        gpu_count = pod_info.get("gpuCount", 1)
+        bid = float(os.environ.get("RUNPOD_SPOT_BID", pod_info.get("costPerHr") or 0.2))
+        query = f"""
+        mutation {{
+            podBidResume(input: {{ podId: "{POD_ID}", gpuCount: {gpu_count}, bidPerGpu: {bid} }}) {{
+                id
+                desiredStatus
+            }}
+        }}
+        """
+        run_graphql_query(query)
+    else:
+        raise
 log("Resume request sent.")
 
 # ---------------------------------------------------------------------------

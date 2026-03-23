@@ -1,6 +1,11 @@
 # lapulga-llm Makefile
 # Usage: make <target>
 
+ifneq (,$(wildcard ./.env))
+    include .env
+    export
+endif
+
 SHARDS ?= 10
 PROMPT ?= "Once upon a time"
 MAX_TOKENS ?= 100
