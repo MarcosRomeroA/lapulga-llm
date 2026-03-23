@@ -82,11 +82,10 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
                 param.data = param.data.float()
 
     # Enable gradient checkpointing for VRAM savings
-    model.gradient_checkpointing_enable()
     model.train()
 
-    print("Compiling model (mode=reduce-overhead)...")
-    compiled_model = torch.compile(model, mode="reduce-overhead")
+    print("Compiling model (torch.compile, default mode)...")
+    compiled_model = torch.compile(model)
 
     # ------------------------------------------------------------
     # Optimizer — fused AdamW
