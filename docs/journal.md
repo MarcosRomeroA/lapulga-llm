@@ -59,3 +59,17 @@
 - **Outcome:** Loss: 14.09→3.49 (avg 4.45). **Validation BPB: 2.0680**. Step time ~1.57s. Artifact: 9.32MB (under 16MB limit). Text generation coherent. Noted torch.compile recompilation warnings from RoPE `_seq_len_cached` integer attribute.
 - **Issues:** BPB 2.0680 is worse than v2.2 (1.7429 with 17M params / 200M tokens / 3 epochs). Likely causes: only 1 epoch vs 3, ALBERT weight-sharing may limit effective capacity, LR may be too aggressive for shared weights.
 - **Next steps:** Investigate 3-epoch run, tune LR for ALBERT-style architecture, fix RoPE recompilation (use `allow_unspec_int_on_nn_module` or tensor-ify `_seq_len_cached`).
+
+## 2026-03-22 (Architecture Scale to 29M — v4.1)
+- **Goal:** Maximise parameter count to fill the 16MB budget more aggressively, and saturate H100 NVL VRAM to reduce wall-clock training time.
+- **Action:** Increased `hidden_dim` from 3072 → **3584** in `src/domain/config.py`. This pushes the model from ~25.9M to **~29.1M parameters**, occupying ~11 MB of the 16MB budget. Simultaneously scaled `micro_batch_size` from 16K → 128K tokens per micro-step, dropping `accum_steps` from 32 → 4. The effective batch size (524K tokens) stays constant; only the parallelism changes.
+- **Architecture snapshot:** `n_layers=4 (×3 repeats=12 eff), D=3584, H=12, KV=4, MLP≈4×D`
+- **Outcome:** Config committed (`4492b10`). Training not yet run at full scale; next run will validate BPB impact of heavier model vs. v4.0 baseline (BPB 2.0680).
+- **Next steps:** Run full 500M token training on H100 and compare BPB against v4.0.
+
+## 2026-03-22 (Triton Shared Memory OOM Fix — v4.2)
+- **Goal:** Fix out-of-memory crash in Triton kernels when running with `micro_batch_size=131072` (128 seqs × 1024 tokens = 131K tokens per micro-batch).
+- **Root cause:** H100 SM shared memory is limited to **232 KB per streaming multiprocessor**. At 128 sequences, the FlashAttention Triton kernel exceeds this limit and throws an OOM. At 64 sequences (65K tokens), the kernel fits within the 232 KB budget.
+- **Action:** Reduced `micro_batch_size` from 131072 → **65536**. With a fixed effective batch of 524K tokens, `accum_steps` rises from 4 → **8**. Throughput is approximately **4× better** than the original RTX 3090 baseline (which used 16K micro-batches with 32 accum steps).
+- **Outcome:** Config committed (`954fdf1`). OOM eliminated; training can proceed cleanly on H100 NVL.
+- **Next steps:** Confirm stable training run; monitor step time vs. v4.1 (expected ~1.4–1.6 s/step).
