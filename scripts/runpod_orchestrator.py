@@ -123,6 +123,7 @@ SSH_OPTS = [
     "-p", str(ssh_port),
     "-o", "StrictHostKeyChecking=no",
     "-o", "BatchMode=yes",
+    "-t",
 ]
 REMOTE = f"root@{ssh_ip}"
 
@@ -132,7 +133,7 @@ try:
     subprocess.run(
         ["ssh"] + SSH_OPTS + [
             REMOTE,
-            "cd /workspace/lapulga-llm && git pull && uv run main.py",
+            "cd /workspace/lapulga-llm && git pull && PYTHONUNBUFFERED=1 uv run main.py",
         ],
         check=True,
     )
