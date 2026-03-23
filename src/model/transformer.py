@@ -41,30 +41,23 @@ class RMSNorm(nn.Module):
 
 class Rotary(nn.Module):
     """
-    Rotary Position Embeddings with cached cos/sin tables.
-    Caches are rebuilt when sequence length or device changes.
+    Rotary Position Embeddings with pre-computed cos/sin tables.
+    Tables are computed once at init for the fixed context_length,
+    stored as buffers (no mutation during forward — torch.compile safe).
     """
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, max_seq_len: int = 1024, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached: int = 0
-        self._cos_cached: Tensor | None = None
-        self._sin_cached: Tensor | None = None
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer("cos_table", freqs.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_table", freqs.sin()[None, None, :, :], persistent=False)
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached != seq_len
-            or self._cos_cached.device != device
-        ):
-            positions = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(positions, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        return (
+            self.cos_table[:, :, :seq_len, :].to(dtype=dtype),
+            self.sin_table[:, :, :seq_len, :].to(dtype=dtype),
+        )
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
