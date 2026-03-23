@@ -5,8 +5,7 @@ Exports via int8 quantization + zlib compression (official Parameter-Golf format
 
 Optimizations applied (matching official parameter-golf baseline):
   - CastedLinear: FP32 weights, BF16 compute (better convergence)
-  - torch.compile(dynamic=False, fullgraph=True) on unrolled ALBERT sequence
-  - Gradient checkpointing for massive micro-batches (accum_steps=1)
+  - torch.compile(mode='max-autotune') for H100-specific kernel optimization
   - TF32 matmuls + Flash Attention only (no fallback SDP backends)
   - 20 warmup steps with model/optimizer state reset to eliminate Step 0 penalty
   - Fused Adam optimizer
@@ -51,7 +50,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     """
     Executes the main optimization loop on FineWeb shards.
     All training data is pre-loaded into RAM to eliminate I/O bottlenecks.
-    Uses CastedLinear (FP32 weights), gradient checkpointing, and torch.compile.
+    Uses CastedLinear (FP32 weights) and torch.compile(max-autotune).
     """
     dev_mode: bool = os.environ.get("DEV_MODE", "0") == "1"
 
@@ -81,10 +80,9 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
             if param.ndim < 2 and param.dtype != torch.float32:
                 param.data = param.data.float()
 
-    # Enable gradient checkpointing for VRAM savings
     model.train()
 
-    print("Compiling model (torch.compile, default mode)...")
+    print("Compiling model (torch.compile)...")
     compiled_model = torch.compile(model)
 
     # ------------------------------------------------------------
@@ -165,7 +163,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     print(f"    Batch tokens: {batch_tokens:,} | Micro tokens: {micro_tokens:,} | Accum steps: {accum_steps}")
     print(f"    Seq len: {seq_len} | Steps/epoch: {steps_per_epoch} | Total steps: {total_steps}")
     print(f"    LR: {train_config.learning_rate} | LR warmup: {lr_warmup_steps} steps | Log every {log_interval} steps")
-    print(f"    Gradient checkpointing: ENABLED")
+    print(f"    torch.compile: max-autotune")
 
     # ------------------------------------------------------------
     # Main training loop

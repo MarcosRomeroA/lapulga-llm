@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
+
 from typing import Optional
 from src.domain.config import ModelConfig
 
@@ -165,15 +165,12 @@ class LanguageModel(nn.Module):
     ALBERT-style Cross-Layer Sharing: 4 physical blocks repeated 3× = 12 effective layers.
     The ALBERT loop is UNROLLED into self.full_sequence for torch.compile compatibility.
     Modules are repeated references (shared weights), so param count stays the same.
-
-    Gradient checkpointing is supported via self.use_gradient_checkpointing flag.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.vocab_size: int = config.vocab_size
         self.logit_softcap: float = config.logit_softcap
-        self.use_gradient_checkpointing: bool = False
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
 
@@ -206,18 +203,6 @@ class LanguageModel(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def gradient_checkpointing_enable(self) -> None:
-        """Enable gradient checkpointing for VRAM savings."""
-        self.use_gradient_checkpointing = True
-
-    def gradient_checkpointing_disable(self) -> None:
-        """Disable gradient checkpointing."""
-        self.use_gradient_checkpointing = False
-
-    def _run_block(self, block: TransformerBlock, x: Tensor, x0: Tensor) -> Tensor:
-        """Wrapper for gradient checkpointing compatibility."""
-        return block(x, x0)
-
     def forward(self, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> Tensor:
         x = self.tok_embeddings(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -227,22 +212,16 @@ class LanguageModel(nn.Module):
         num_encoder: int = self.config.effective_layers // 2
         decoder_step: int = 0
 
-        # Unrolled linear sequence — no Python loop at trace time
+        # Unrolled linear sequence — clean path, no branches
         for virtual_idx, block in enumerate(self.full_sequence):
             if virtual_idx < num_encoder:
-                if self.use_gradient_checkpointing and self.training:
-                    x = checkpoint(self._run_block, block, x, x0, use_reentrant=False)
-                else:
-                    x = block(x, x0)
+                x = block(x, x0)
                 skips.append(x)
             else:
                 if skips:
                     sw = self.skip_weights[decoder_step].to(dtype=x.dtype)[None, None, :]
                     x = x + sw * skips.pop()
-                if self.use_gradient_checkpointing and self.training:
-                    x = checkpoint(self._run_block, block, x, x0, use_reentrant=False)
-                else:
-                    x = block(x, x0)
+                x = block(x, x0)
                 decoder_step += 1
 
         x = self.norm(x)
