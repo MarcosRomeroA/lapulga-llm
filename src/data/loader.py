@@ -4,8 +4,10 @@ Abstracts the processing of raw text into PyTorch tensors.
 Uses La Pulga's custom BPE tokenizer (trained on TinyStories).
 """
 import torch
+from torch.utils.data import IterableDataset, get_worker_info
 from tokenizers import Tokenizer
 from typing import Generator, Tuple, Iterable
+from src.data.shard_loader import TokenStream, load_data_shard
 
 
 def load_tokenizer(tokenizer_path: str = "tokenizer.json") -> Tokenizer:
@@ -58,3 +60,39 @@ def get_batches(
         inputs = input_tensors[:, i : i + context_length].to(device)
         targets = target_tokens_arr[:, i : i + context_length].to(device)
         yield inputs, targets
+
+
+class FineWebDataset(IterableDataset):
+    """
+    Wraps TokenStream into a PyTorch IterableDataset yielding (x, y) sequences.
+    Safely distributes shard files across multiple DataLoader workers to prevent duplicated data.
+    """
+    def __init__(self, shard_pattern: str, seq_len: int):
+        super().__init__()
+        self.shard_pattern = shard_pattern
+        self.seq_len = seq_len
+        
+    def __iter__(self):
+        worker_info = get_worker_info()
+        stream = TokenStream(self.shard_pattern)
+        
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # Distribute shards (files) based on worker ID securely
+            worker_files = [f for i, f in enumerate(stream.files) if i % num_workers == worker_id]
+            if not worker_files:
+                worker_files = stream.files  # Fallback
+                
+            stream.files = worker_files
+            stream.file_idx = 0
+            stream.tokens = load_data_shard(stream.files[0])
+            stream.pos = 0
+
+        while True:
+            # Yield (x, y) token pairs natively
+            chunk = stream.take(self.seq_len + 1)
+            x = chunk[:-1].to(torch.int64)
+            y = chunk[1:].to(torch.int64)
+            yield x, y

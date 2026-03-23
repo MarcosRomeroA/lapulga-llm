@@ -13,7 +13,8 @@ import torch
 from safetensors.torch import save_file as safetensors_save
 from src.domain.config import TrainingConfig
 from src.model.transformer import LanguageModel, DEVICE
-from src.data.shard_loader import TokenStream
+from src.data.loader import FineWebDataset
+from torch.utils.data import DataLoader
 from src.utils.quantize import quantize_state_dict_int8
 
 
@@ -27,9 +28,8 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     model.to(DEVICE)
     model.train()
 
-    # torch.compile disabled: Triton exceeds RTX 3090 shared memory limit
-    # during backward pass compilation of fused RMSNorm kernels.
-    compiled_model = model
+    print("Compiling model for H100 (torch.compile)...")
+    compiled_model = torch.compile(model)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
     use_amp: bool = DEVICE.type == "cuda"
@@ -40,9 +40,18 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     micro_tokens: int = train_config.micro_batch_size  # tokens per forward pass
     accum_steps: int = max(1, batch_tokens // micro_tokens)
 
-    # Open the shard stream
+    # Initialize DataLoader with IterableDataset
     shard_pattern: str = os.path.join(train_config.data_path, "fineweb_train_*.bin")
-    stream = TokenStream(shard_pattern)
+    dataset = FineWebDataset(shard_pattern, seq_len)
+    
+    batch_size = max(1, micro_tokens // seq_len)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=4,
+        pin_memory=True,
+    )
+    data_iter = iter(dataloader)
 
     # Calculate steps: train_tokens / batch_tokens * epochs
     steps_per_epoch: int = max(1, train_config.train_tokens // batch_tokens)
@@ -83,10 +92,14 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
             step_loss: float = 0.0
 
             for micro_step in range(accum_steps):
-                # Read a micro-batch of tokens and build (x, y) pairs
-                chunk = stream.take(micro_tokens + 1)
-                x = chunk[:-1].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64)
-                y = chunk[1:].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64)
+                try:
+                    x, y = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+                    x, y = next(data_iter)
+
+                x = x.to(device=DEVICE, non_blocking=True)
+                y = y.to(device=DEVICE, non_blocking=True)
 
                 with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                     loss_val = compiled_model(x, y)
