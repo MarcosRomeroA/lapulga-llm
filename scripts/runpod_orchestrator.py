@@ -45,13 +45,13 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 log(f"Resuming pod {POD_ID}...")
 try:
-    runpod.resume_pod(pod_id=POD_ID, gpu_count=1)
+    runpod.resume_pod(pod_id=POD_ID, gpu_count=8)
 except runpod.error.QueryError as e:
     if "spot pod" in str(e).lower():
         log("Spot pod detected. Using podBidResume via GraphQL...")
         from runpod.api.graphql import run_graphql_query
         pod_info = runpod.get_pod(POD_ID)
-        gpu_count = pod_info.get("gpuCount", 1)
+        gpu_count = pod_info.get("gpuCount", 8)
         bid = float(os.environ.get("RUNPOD_SPOT_BID", pod_info.get("costPerHr") or 0.2))
         query = f"""
         mutation {{
@@ -133,7 +133,13 @@ try:
     subprocess.run(
         ["ssh"] + SSH_OPTS + [
             REMOTE,
-            "cd /workspace/lapulga-llm && git pull && PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=8 train_gpt.py",
+            "cd /workspace/lapulga-llm && git pull && "
+            "RUN_ID=baseline_sp1024 "
+            "DATA_PATH=/workspace/parameter-golf/data/datasets/fineweb10B_sp1024/ "
+            "TOKENIZER_PATH=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model "
+            "VOCAB_SIZE=1024 "
+            "PYTHONUNBUFFERED=1 "
+            "torchrun --standalone --nproc_per_node=8 train_gpt.py",
         ],
         check=True,
     )
