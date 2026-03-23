@@ -133,6 +133,7 @@ try:
     subprocess.run(
         ["ssh"] + SSH_OPTS + [
             REMOTE,
+            "if [ ! -d '/workspace/lapulga-llm' ]; then git clone https://github.com/MarcosRomeroA/lapulga-llm.git /workspace/lapulga-llm; fi && "
             "cd /workspace/lapulga-llm && git pull && "
             "RUN_ID=baseline_sp1024 "
             "DATA_PATH=/workspace/parameter-golf/data/datasets/fineweb10B_sp1024/ "
