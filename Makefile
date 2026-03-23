@@ -8,7 +8,7 @@ TEMPERATURE ?= 0.8
 TOP_K ?= 50
 REP_PENALTY ?= 1.2
 
-.PHONY: run generate test test-scoring download-data help
+.PHONY: run generate test test-scoring download-data run-cloud help
 
 ## Run the full training + BPB evaluation pipeline
 run:
@@ -30,6 +30,10 @@ test-scoring:
 download-data:
 	uv run python data/download_fineweb.py --variant sp1024 --train-shards $(SHARDS)
 
+## Start RunPod, train, download artifacts, stop Pod (zero-click)
+run-cloud:
+	@PYTHONUNBUFFERED=1 uv run scripts/runpod_orchestrator.py
+
 ## Show available commands
 help:
 	@echo ""
@@ -42,4 +46,5 @@ help:
 	@echo "  make test-scoring     Run official scoring mock tests only"
 	@echo "  make download-data    Download FineWeb shards (SHARDS=10)"
 	@echo "  make download-data SHARDS=1   Download 1 shard (smoke test)"
+	@echo "  make run-cloud        Start RunPod, train, download artifacts, stop Pod"
 	@echo ""

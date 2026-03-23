@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 *$py.class
 .venv/
 venv/
@@ -21,3 +22,9 @@ val.txt
 # IDEs
 .idea/
 .vscode/
+
+# Secrets
+.env
+
+# Logs
+/*.log
