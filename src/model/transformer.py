@@ -2,27 +2,41 @@
 PyTorch Implementation of La Pulga Transformer.
 Aligned with the official OpenAI Parameter-Golf architecture.
 Uses relu^2 MLP, U-Net skip connections, logit softcap, and SDPA.
+
+Optimizations for H100:
+  - CastedLinear: FP32 weights, BF16 compute (better optimizer precision)
+  - Unrolled ALBERT loop: torch.compile sees a linear sequence, no graph breaks
+  - Gradient checkpointing: ~70-80% VRAM savings, allows huge micro-batches
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 from typing import Optional
 from src.domain.config import ModelConfig
 
 DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+class CastedLinear(nn.Linear):
+    """
+    Keeps weights in FP32 for optimizer precision, casts to input dtype at matmul time.
+    Under torch.autocast(bf16), the .to(x.dtype) is essentially free.
+    Matches the official parameter-golf baseline pattern.
+    """
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 
-    def forward(self, input_tensor: Tensor) -> Tensor:
-        return F.rms_norm(input_tensor, (self.dim,), self.weight, self.eps)
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (no learnable weight for compile compat)."""
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
 class Rotary(nn.Module):
@@ -35,8 +49,8 @@ class Rotary(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached: int = 0
-        self._cos_cached: Optional[Tensor] = None
-        self._sin_cached: Optional[Tensor] = None
+        self._cos_cached: Tensor | None = None
+        self._sin_cached: Tensor | None = None
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         if (
@@ -72,10 +86,10 @@ class Attention(nn.Module):
         self.head_dim: int = config.dim // config.n_heads
         kv_dim: int = self.n_kv_heads * self.head_dim
 
-        self.wq = nn.Linear(config.dim, config.dim, bias=False)
-        self.wk = nn.Linear(config.dim, kv_dim, bias=False)
-        self.wv = nn.Linear(config.dim, kv_dim, bias=False)
-        self.wo = nn.Linear(config.dim, config.dim, bias=False)
+        self.wq = CastedLinear(config.dim, config.dim, bias=False)
+        self.wk = CastedLinear(config.dim, kv_dim, bias=False)
+        self.wv = CastedLinear(config.dim, kv_dim, bias=False)
+        self.wo = CastedLinear(config.dim, config.dim, bias=False)
         self.wo._zero_init = True
 
         self.q_gain = nn.Parameter(torch.full((config.n_heads,), 1.0, dtype=torch.float32))
@@ -114,8 +128,8 @@ class MLP(nn.Module):
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.fc = nn.Linear(config.dim, config.hidden_dim, bias=False)
-        self.proj = nn.Linear(config.hidden_dim, config.dim, bias=False)
+        self.fc = CastedLinear(config.dim, config.hidden_dim, bias=False)
+        self.proj = CastedLinear(config.hidden_dim, config.dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, input_tensor: Tensor) -> Tensor:
@@ -133,8 +147,8 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attention = Attention(config)
         self.feed_forward = MLP(config)
-        self.attention_norm = RMSNorm(config.dim, config.norm_eps)
-        self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
+        self.attention_norm = RMSNorm()
+        self.ffn_norm = RMSNorm()
         self.attn_scale = nn.Parameter(torch.ones(config.dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(config.dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(
@@ -156,19 +170,17 @@ class LanguageModel(nn.Module):
     La Pulga — Fat ALBERT variant for H100.
 
     ALBERT-style Cross-Layer Sharing: 4 physical blocks repeated 3× = 12 effective layers.
-    At dim=768 the H100's 228KB L1 shared memory easily fits fused RMSNorm backward kernels
-    (vs the RTX 3090's 101KB limit which forced dim=512).
+    The ALBERT loop is UNROLLED into self.full_sequence for torch.compile compatibility.
+    Modules are repeated references (shared weights), so param count stays the same.
 
-    Budget breakdown (stored params ~26M, artifact ~12MB int8+zlib):
-    - 4 physical layers × ~6.3M params/layer = ~25.2M
-    - Embeddings 1024×768 (tied as output head)  = 0.79M
-    - Skip weights 6×768 + final norm             = ~5K
+    Gradient checkpointing is supported via self.use_gradient_checkpointing flag.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.vocab_size: int = config.vocab_size
         self.logit_softcap: float = config.logit_softcap
+        self.use_gradient_checkpointing: bool = False
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
 
@@ -180,9 +192,18 @@ class LanguageModel(nn.Module):
             torch.ones(self.num_skip_weights, config.dim, dtype=torch.float32)
         )
 
-        # Only physical_layers unique blocks stored — shared across repeats
+        # Physical layers — only these hold unique parameters
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.physical_layers)])
-        self.norm = RMSNorm(config.dim, config.norm_eps)
+
+        # UNROLLED sequence: repeated references to the physical layers.
+        # torch.compile sees 12 linear calls, NOT a Python loop.
+        # Weights are shared — self.full_sequence[0] IS self.layers[0].
+        self.full_sequence = nn.ModuleList()
+        for _ in range(config.repeat_count):
+            for layer in self.layers:
+                self.full_sequence.append(layer)
+
+        self.norm = RMSNorm()
 
         self._init_weights()
 
@@ -192,6 +213,18 @@ class LanguageModel(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def gradient_checkpointing_enable(self) -> None:
+        """Enable gradient checkpointing for VRAM savings."""
+        self.use_gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self) -> None:
+        """Disable gradient checkpointing."""
+        self.use_gradient_checkpointing = False
+
+    def _run_block(self, block: TransformerBlock, x: Tensor, x0: Tensor) -> Tensor:
+        """Wrapper for gradient checkpointing compatibility."""
+        return block(x, x0)
+
     def forward(self, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> Tensor:
         x = self.tok_embeddings(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -199,27 +232,30 @@ class LanguageModel(nn.Module):
         skips: list[Tensor] = []
 
         num_encoder: int = self.config.effective_layers // 2
-        virtual_idx: int = 0
         decoder_step: int = 0
 
-        # ALBERT loop: traverse the 4 physical blocks repeat_count times
-        for _ in range(self.config.repeat_count):
-            for layer in self.layers:
-                if virtual_idx < num_encoder:
-                    x = layer(x, x0)
-                    skips.append(x)
+        # Unrolled linear sequence — no Python loop at trace time
+        for virtual_idx, block in enumerate(self.full_sequence):
+            if virtual_idx < num_encoder:
+                if self.use_gradient_checkpointing and self.training:
+                    x = checkpoint(self._run_block, block, x, x0, use_reentrant=False)
                 else:
-                    if skips:
-                        sw = self.skip_weights[decoder_step].to(dtype=x.dtype)[None, None, :]
-                        x = x + sw * skips.pop()
-                    x = layer(x, x0)
-                    decoder_step += 1
-                virtual_idx += 1
+                    x = block(x, x0)
+                skips.append(x)
+            else:
+                if skips:
+                    sw = self.skip_weights[decoder_step].to(dtype=x.dtype)[None, None, :]
+                    x = x + sw * skips.pop()
+                if self.use_gradient_checkpointing and self.training:
+                    x = checkpoint(self._run_block, block, x, x0, use_reentrant=False)
+                else:
+                    x = block(x, x0)
+                decoder_step += 1
 
         x = self.norm(x)
 
         # Weight Tying: reuse tok_embeddings.weight as the output head
-        logits = F.linear(x, self.tok_embeddings.weight)
+        logits = F.linear(x, self.tok_embeddings.weight.to(x.dtype))
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
 
         if target_ids is not None:

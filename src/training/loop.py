@@ -4,8 +4,9 @@ Pre-loads all training data into RAM, then trains with pure tensor slicing.
 Exports via int8 quantization + zlib compression (official Parameter-Golf format).
 
 Optimizations applied (matching official parameter-golf baseline):
-  - Native bfloat16 model + autocast (no GradScaler needed on H100)
-  - torch.compile(dynamic=False, fullgraph=True) for max kernel fusion
+  - CastedLinear: FP32 weights, BF16 compute (better convergence)
+  - torch.compile(dynamic=False, fullgraph=True) on unrolled ALBERT sequence
+  - Gradient checkpointing for massive micro-batches (accum_steps=1)
   - TF32 matmuls + Flash Attention only (no fallback SDP backends)
   - 20 warmup steps with model/optimizer state reset to eliminate Step 0 penalty
   - Fused Adam optimizer
@@ -27,7 +28,7 @@ from torch.backends.cuda import (
 )
 from safetensors.torch import save_file as safetensors_save
 from src.domain.config import TrainingConfig
-from src.model.transformer import LanguageModel, DEVICE
+from src.model.transformer import LanguageModel, CastedLinear, DEVICE
 from src.data.loader import preload_train_tokens
 from src.utils.quantize import quantize_state_dict_int8
 
@@ -50,7 +51,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     """
     Executes the main optimization loop on FineWeb shards.
     All training data is pre-loaded into RAM to eliminate I/O bottlenecks.
-    Trains in native bfloat16 with torch.compile, then exports via int8+zlib.
+    Uses CastedLinear (FP32 weights), gradient checkpointing, and torch.compile.
     """
     dev_mode: bool = os.environ.get("DEV_MODE", "0") == "1"
 
@@ -65,17 +66,30 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     enable_math_sdp(False)
 
     # ------------------------------------------------------------
-    # Model — native bfloat16, keep small params in fp32
+    # Model setup: bf16 body, FP32 CastedLinear weights + scalars
+    # Matches official parameter-golf pattern for optimizer precision.
     # ------------------------------------------------------------
     model.to(DEVICE)
     model.bfloat16()
+    # Restore CastedLinear weights to FP32 (cast to bf16 happens at matmul time)
+    for module in model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    # Restore small/control params to FP32 for optimizer stability
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.ndim < 2 and param.dtype != torch.float32:
+                param.data = param.data.float()
+
+    # Enable gradient checkpointing for VRAM savings
+    model.gradient_checkpointing_enable()
     model.train()
 
     print("Compiling model (dynamic=False, fullgraph=True)...")
     compiled_model = torch.compile(model, dynamic=False, fullgraph=True)
 
     # ------------------------------------------------------------
-    # Optimizer — fused AdamW, no GradScaler needed in bf16
+    # Optimizer — fused AdamW
     # ------------------------------------------------------------
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -121,7 +135,6 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
 
     # ------------------------------------------------------------
     # Compiler warmup: run N throwaway steps, then reset state
-    # This eliminates the ~50s penalty on Step 0 during real training
     # ------------------------------------------------------------
     warmup_steps_count = 0 if dev_mode else _COMPILE_WARMUP_STEPS
     if warmup_steps_count > 0:
@@ -153,6 +166,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     print(f"    Batch tokens: {batch_tokens:,} | Micro tokens: {micro_tokens:,} | Accum steps: {accum_steps}")
     print(f"    Seq len: {seq_len} | Steps/epoch: {steps_per_epoch} | Total steps: {total_steps}")
     print(f"    LR: {train_config.learning_rate} | LR warmup: {lr_warmup_steps} steps | Log every {log_interval} steps")
+    print(f"    Gradient checkpointing: ENABLED")
 
     # ------------------------------------------------------------
     # Main training loop
