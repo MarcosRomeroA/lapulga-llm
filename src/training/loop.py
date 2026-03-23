@@ -42,12 +42,11 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
 
     # Initialize DataLoader with IterableDataset
     shard_pattern: str = os.path.join(train_config.data_path, "fineweb_train_*.bin")
-    dataset = FineWebDataset(shard_pattern, seq_len)
+    dataset = FineWebDataset(shard_pattern, seq_len, micro_tokens)
     
-    batch_size = max(1, micro_tokens // seq_len)
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=None,  # Optimization: dataset natively yields pre-batched matrices
         num_workers=4,
         pin_memory=True,
     )

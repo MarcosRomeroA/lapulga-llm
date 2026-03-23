@@ -67,10 +67,11 @@ class FineWebDataset(IterableDataset):
     Wraps TokenStream into a PyTorch IterableDataset yielding (x, y) sequences.
     Safely distributes shard files across multiple DataLoader workers to prevent duplicated data.
     """
-    def __init__(self, shard_pattern: str, seq_len: int):
+    def __init__(self, shard_pattern: str, seq_len: int, micro_tokens: int):
         super().__init__()
         self.shard_pattern = shard_pattern
         self.seq_len = seq_len
+        self.micro_tokens = micro_tokens
         
     def __iter__(self):
         worker_info = get_worker_info()
@@ -91,8 +92,8 @@ class FineWebDataset(IterableDataset):
             stream.pos = 0
 
         while True:
-            # Yield (x, y) token pairs natively
-            chunk = stream.take(self.seq_len + 1)
-            x = chunk[:-1].to(torch.int64)
-            y = chunk[1:].to(torch.int64)
+            # Yield pre-batched macro-blocks natively to avoid PyTorch collation overhead
+            chunk = stream.take(self.micro_tokens + 1)
+            x = chunk[:-1].reshape(-1, self.seq_len).to(torch.int64)
+            y = chunk[1:].reshape(-1, self.seq_len).to(torch.int64)
             yield x, y
