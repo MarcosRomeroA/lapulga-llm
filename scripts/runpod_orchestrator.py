@@ -133,7 +133,7 @@ try:
     subprocess.run(
         ["ssh"] + SSH_OPTS + [
             REMOTE,
-            "cd /workspace/lapulga-llm && git pull && PYTHONUNBUFFERED=1 uv run main.py",
+            "cd /workspace/lapulga-llm && git pull && PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=8 train_gpt.py",
         ],
         check=True,
     )
@@ -147,12 +147,12 @@ try:
 
     subprocess.run(
         ["scp"] + ["-i", SSH_KEY, "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no"] + [
-            f"{REMOTE}:/workspace/lapulga-llm/lapulga_weights.safetensors",
-            f"{dest_dir}/lapulga_weights.safetensors",
+            f"{REMOTE}:/workspace/lapulga-llm/lapulga_submission_bf16.pt",
+            f"{dest_dir}/lapulga_submission_bf16.pt",
         ],
         check=True,
     )
-    log("Downloaded lapulga_weights.safetensors")
+    log("Downloaded lapulga_submission_bf16.pt")
 
     # Training log is optional — don't fail if absent
     result = subprocess.run(
