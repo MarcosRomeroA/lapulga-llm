@@ -85,8 +85,8 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     model.gradient_checkpointing_enable()
     model.train()
 
-    print("Compiling model (dynamic=False, fullgraph=True)...")
-    compiled_model = torch.compile(model, dynamic=False, fullgraph=True)
+    print("Compiling model (mode=reduce-overhead)...")
+    compiled_model = torch.compile(model, mode="reduce-overhead")
 
     # ------------------------------------------------------------
     # Optimizer — fused AdamW
