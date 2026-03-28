@@ -30,7 +30,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Environment & Paths
-    data_path = os.environ.get("DATA_PATH", "/workspace/data/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
@@ -534,7 +534,18 @@ def main():
     while True:
         # Check wallclock: Break at 590s
         elapsed = time.perf_counter() - t0_wallclock
-        if elapsed >= max_wallclock:
+        
+        # Sincronizamos la decisión de frenar desde el rank 0 para evitar deadlocks
+        # si los relojes de alguna GPU varían por milisegundos.
+        if master_process:
+            stop_training = torch.tensor([1 if elapsed >= max_wallclock else 0], dtype=torch.int32, device=device)
+        else:
+            stop_training = torch.tensor([0], dtype=torch.int32, device=device)
+            
+        if distributed:
+            dist.broadcast(stop_training, src=0)
+            
+        if stop_training.item() == 1:
             if master_process:
                 print(f"\n--- Wallclock limit reached ({elapsed:.1f}s >= {max_wallclock}s). Halting. ---")
             break
@@ -578,12 +589,15 @@ def main():
         # Pre-fetch next batch before measuring time of the NEXT step
         x, y = train_loader.next_batch(device)
 
-    # Final Eval & Save (Master only)
+    # Final Eval & Save
     if master_process:
         print("\n--- Final Evaluation ---")
-        val_loss, val_bpb = eval_val(
-            args, model, 0, 1, device, val_tokens, base_bytes, has_space, is_boundary
-        )
+        
+    val_loss, val_bpb = eval_val(
+        args, model, rank, world_size, device, val_tokens, base_bytes, has_space, is_boundary
+    )
+    
+    if master_process:
         print(f"Final Val Loss: {val_loss:.4f} | Final Val BPB: {val_bpb:.4f}")
         
         print("\n--- Saving Artifact (bfloat16 direct) ---")

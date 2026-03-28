@@ -128,16 +128,27 @@ SSH_OPTS = [
 REMOTE = f"root@{ssh_ip}"
 
 try:
+    # ---- Upload training script ----
+    script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "train_gpt.py")
+    log(f"Uploading local script to remote: {script_path}")
+    subprocess.run(
+        ["scp"] + ["-i", SSH_KEY, "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no"] + [
+            script_path,
+            f"{REMOTE}:/workspace/train_gpt.py",
+        ],
+        check=True,
+    )
+
     # ---- Execute training ----
     log("Starting remote training...")
     subprocess.run(
         ["ssh"] + SSH_OPTS + [
             REMOTE,
-            "if [ ! -d '/workspace/lapulga-llm' ]; then git clone https://github.com/MarcosRomeroA/lapulga-llm.git /workspace/lapulga-llm; fi && "
-            "cd /workspace/lapulga-llm && git pull && "
+            "if [ ! -d '/workspace/parameter-golf/.git' ]; then rm -rf /workspace/parameter-golf; git clone https://github.com/openai/parameter-golf.git /workspace/parameter-golf; fi && "
+            "if [ ! -d '/workspace/parameter-golf/data/datasets/fineweb10B_sp1024' ]; then cd /workspace/parameter-golf && python3 data/cached_challenge_fineweb.py --variant sp1024; fi && "
+            "mv /workspace/train_gpt.py /workspace/parameter-golf/train_gpt.py && "
+            "cd /workspace/parameter-golf && "
             "RUN_ID=baseline_sp1024 "
-            "DATA_PATH=/workspace/parameter-golf/data/datasets/fineweb10B_sp1024/ "
-            "TOKENIZER_PATH=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model "
             "VOCAB_SIZE=1024 "
             "PYTHONUNBUFFERED=1 "
             "torchrun --standalone --nproc_per_node=8 train_gpt.py",
@@ -154,7 +165,7 @@ try:
 
     subprocess.run(
         ["scp"] + ["-i", SSH_KEY, "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no"] + [
-            f"{REMOTE}:/workspace/lapulga-llm/lapulga_submission_bf16.pt",
+            f"{REMOTE}:/workspace/parameter-golf/lapulga_submission_bf16.pt",
             f"{dest_dir}/lapulga_submission_bf16.pt",
         ],
         check=True,
@@ -164,7 +175,7 @@ try:
     # Training log is optional — don't fail if absent
     result = subprocess.run(
         ["scp"] + ["-i", SSH_KEY, "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no"] + [
-            f"{REMOTE}:/workspace/lapulga-llm/training_run_oficial.log",
+            f"{REMOTE}:/workspace/parameter-golf/training_run_oficial.log",
             f"{dest_dir}/training_run_oficial.log",
         ],
     )
