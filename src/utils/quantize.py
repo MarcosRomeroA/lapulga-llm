@@ -46,21 +46,25 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     - 1D/scalar tensors: per-tensor quantization
     """
     t32 = t.float()
-    if t32.ndim == 2:
+    if t32.ndim >= 2:
+        t32_2d = t32.view(-1, t32.shape[-1])
         clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
+            torch.quantile(t32_2d.abs(), INT8_CLIP_Q, dim=1)
+            if t32_2d.numel()
+            else torch.empty((t32_2d.shape[0],), dtype=torch.float32)
         )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        clipped = torch.maximum(torch.minimum(t32_2d, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -31, 31).to(torch.int8)
+        
+        q = q.view(t32.shape).contiguous()
+        scale = scale.view(t32.shape[:-1]).to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        return q, scale
 
     # Vectors / scalars: single scale for the whole tensor
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()
     return q, scale
 
 
@@ -135,7 +139,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * s.unsqueeze(-1)).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
             out[name] = (q.float() * scale).to(dtype=dtype).contiguous()

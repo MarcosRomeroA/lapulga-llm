@@ -8,13 +8,13 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ModelConfig:
     """Configuration schema for the La Pulga Transformer architecture."""
-    dim: int = 768
-    embed_dim: int = 768  # Factored embedding to save bytes
-    physical_layers: int = 4
+    dim: int = 512
+    embed_dim: int = 512  # Factored embedding to save bytes
+    physical_layers: int = 10
     repeat_count: int = 1
-    n_heads: int = 12
+    n_heads: int = 8
     n_kv_heads: int = 4
-    hidden_dim: int = 2048
+    hidden_dim: int = 1536
     n_banks: int = 4  # Parameter banking experts
     vocab_size: int = 1024
     norm_eps: float = 1e-5

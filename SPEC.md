@@ -2,18 +2,18 @@
 model_name: lapulga-llm
 architecture: decoder-only-transformer
 framework: pytorch-2.x
-compute: rtx-3090-cuda-12.1
-n_embd: 768
-n_head: 12
+compute: runpod-8xh100-cuda-12.x
+n_embd: 512
+n_head: 8
 n_kv_heads: 4
-physical_layers: 4
+physical_layers: 10
 repeat_count: 1
-hidden_dim: 4096
+hidden_dim: 1536
 vocab_size: 1024
 context_length: 1024
 constraints:
   max_size_bytes: 16000000
-  target_params: 32257584
+  target_params: 24120478
   tolerance_pct: 1.0
 tokenizer: sentencepiece-sp1024
 dataset: fineweb-sp1024
@@ -36,15 +36,16 @@ All code must conform to this specification. Compliance is enforced automaticall
 | Parameter | Value | Rationale |
 |:---|:---|:---|
 | `architecture` | Decoder-only Transformer | Generative task: next-token prediction |
-| `framework` | PyTorch 2.x | CUDA-native framework for RTX 3090 / H100 |
-| `compute` | RTX 3090 (CUDA 12.1) | 24 GB VRAM, identical pipeline to H100 target |
-| `n_embd` | 768 | H100 228KB L1 cache fits fused RMSNorm backward at this width |
-| `n_head` | 12 | Query heads (head_dim = 64) |
+| 
+| framework | PyTorch 2.x | CUDA-native framework for 8x H100 production training |
+| compute | Runpod 8x H100 (CUDA 12.x) | Official production training environment |
+| `n_embd` | 512 | Width tuned for 10 physical layers within 16MB export budget |
+| `n_head` | 8 | Query heads (head_dim = 64) |
 | `n_kv_heads` | 4 | GQA compression: 3:1 ratio |
-| `physical_layers` | 4 | Unique layer blocks stored on disk |
-| `repeat_count` | 3 | Times the block is traversed during forward pass |
-| `effective_layers` | 12 | 4 physical × 3 repeats — effective depth |
-| `hidden_dim` | 1280 | MLP inner size selected to keep int6+zlib artifact safely under 16,000,000 bytes |
+| `physical_layers` | 10 | Unique banked layer slices stored on disk |
+| `repeat_count` | 1 | No ALBERT-style repetition |
+| `effective_layers` | 10 | 10 physical × 1 repeat |
+| `hidden_dim` | 1536 | MLP inner size selected to keep int6+zlib artifact under 16MB |
 | `vocab_size` | 1024 | SentencePiece sp1024 — official challenge tokenizer |
 | `context_length` | 1024 | Official training sequence length |
 | `norm_eps` | 1e-5 | RMSNorm stability epsilon |
@@ -53,27 +54,27 @@ All code must conform to this specification. Compliance is enforced automaticall
 | `scoring_metric` | BPB (Bits Per Byte) | Tokenizer-agnostic compression on FineWeb val set |
 | `dataset` | FineWeb (sp1024 shards) | Official challenge dataset |
 
-## Fat ALBERT — Cross-Layer Parameter Sharing on H100
+## Parameter Banking + Parallel Muon
 
-Instead of 12 distinct blocks, La Pulga stores only **4 physical blocks** and routes the forward
-pass through them **3 times**. This is the ALBERT strategy adapted for Parameter Golf.
+La Pulga stores **10 physical blocks** as **3D parameter banks** and runs each block once.
+This layout reduces kernel launch overhead and enables batched Muon orthogonalization with `torch.bmm`.
 
-**Why this works on H100 (not RTX 3090):**
-The H100 has **228 KB of L1 Shared Memory per SM** — more than double the RTX 3090's 101 KB.
-Triton's fused RMSNorm backward kernel at `dim=768` requires ~170 KB, which fits comfortably
-on H100 but caused `OutOfMemoryError` locally.
+**Why this works:**
+- No ALBERT sharing overhead during training.
+- Better GPU utilization from banked matmul paths.
+- Muon can process all layer slices in parallel.
 
 **Budget math:**
-- Stored model parameters: 14,959,152 (10 distinct physical layers across 10 effective steps)
-- 12 effective transformer steps maintain full representational depth
-- U-Net skip weights indexed over virtual (effective) layer indices 0–11
+- Stored model parameters: ~24,120,478
+- 10 effective transformer steps (10 physical × 1 repeat)
+- Int6 export (stored as int8 + zlib) remains the artifact gate.
 
 ## Constraints
 
 | Constraint | Value |
 |:---|:---|
 | Max artifact size | **16,000,000 bytes** (decimal) = code bytes + zlib(int8 model) |
-| Target parameter count | **14,959,152** (1% tolerance enforced in CI) |
+| Target parameter count | **~24,120,478** (1% tolerance enforced in CI) |
 | Target BPB | **1.22** (official baseline: 1.2244) |
 | Max training time | **10 minutes** on 8x H100 |
 | Precision (training) | FP32 with AMP (torch.cuda.amp) |
@@ -85,11 +86,11 @@ on H100 but caused `OutOfMemoryError` locally.
 | Component | Params | Notes |
 |:---|:---|:---|
 | Embeddings | ~0.5M | Factored Tied Embeddings (254 dim) |
-| Attention × 4 physical (GQA kv=4) | ~6.3M | wq/wk/wv/wo + q_gain with ALBERT sharing |
-| MLP × 4 physical (LeakyReLU, hidden=2048) | ~12.5M | fc + proj with ALBERT sharing |
-| Scales + residual mix × 4 physical | ~0.01M | attn_scale, mlp_scale, resid_mix |
-| Skip weights (6 × 768) | ~0.004M | U-Net over 12 layer indices |
-| **Total stored** | **~29.5M (logical) -> ~15.9MB (quantized)** | Export size strictly constrained to <16MB |
+| Attention × 10 physical (Banked, GQA kv=4) | ~7.3M | bank_qkv, bank_o, q_gain |
+| MLP × 10 physical (LeakyReLU, hidden=1536) | ~15.7M | bank_fc, bank_proj |
+| Scales + residual mix × 10 physical | ~0.03M | attn_scale, mlp_scale, resid_mix |
+| Skip weights | 0 | Not used in banked architecture |
+| **Total stored** | **~24.1M (logical) -> ~15.9MB (quantized)** | Export size strictly constrained to <16MB |
 
 ## Compliance Gate
 
@@ -98,3 +99,4 @@ python -m unittest tests.test_spec_compliance -v
 ```
 
 This test **must pass** before any commit that touches `src/model/` or `src/domain/config.py`.
+

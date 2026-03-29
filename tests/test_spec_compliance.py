@@ -67,7 +67,7 @@ class TestSpecCompliance(unittest.TestCase):
         """Verify that physical layer count and effective depth match SPEC.md."""
         expected_physical: int = self.spec["physical_layers"]
         expected_effective: int = self.spec["physical_layers"] * self.spec["repeat_count"]
-        actual_physical: int = len(self.model.layers)
+        actual_physical: int = self.model.n_layers
         actual_effective: int = self.model.config.effective_layers
         self.assertEqual(
             actual_physical,
@@ -101,17 +101,12 @@ class TestSpecCompliance(unittest.TestCase):
         )
 
     def test_attention_heads_match_spec(self) -> None:
-        """Verify that query head count matches SPEC.md in every layer."""
-        expected_heads: int = self.spec["n_head"]
-        for layer_index, layer in enumerate(self.model.layers):
-            actual_heads: int = layer.attention.n_heads
-            self.assertEqual(
-                actual_heads,
-                expected_heads,
-                f"Attention head mismatch in layer {layer_index}: "
-                f"model has {actual_heads}, SPEC requires {expected_heads}",
-            )
-
+        """Verify that query head count matches SPEC.md."""
+        self.assertEqual(
+            self.model.n_heads,
+            self.spec["n_head"],
+            f"Attention heads mismatch: model has {self.model.n_heads}, SPEC requires {self.spec["n_head"]}"
+        )
     # -- Parameter Budget Tests --
 
     def test_param_count_within_tolerance(self) -> None:
@@ -200,12 +195,13 @@ class TestSpecCompliance(unittest.TestCase):
         Verify that the model can be placed on CUDA when available.
         On CI without GPU, this test verifies it stays on CPU gracefully.
         """
-        from src.model.transformer import DEVICE
-        test_model = self.model.to(DEVICE)
+        import torch
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        test_model = self.model.to(device)
         self.assertEqual(
             test_model.device.type,
-            DEVICE.type,
-            f"Model device is {test_model.device.type}, expected {DEVICE.type}",
+            device.type,
+            f"Model device is {test_model.device.type}, expected {device.type}",
         )
         self.model.to("cpu")
 

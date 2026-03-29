@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 from safetensors.torch import save_file as safetensors_save
 from src.domain.config import TrainingConfig
-from src.model.transformer import LanguageModel, CastedLinear, DEVICE
+from src.model.transformer import LanguageModel, DEVICE
 from src.data.loader import preload_train_tokens
 from src.utils.quantize import quantize_state_dict_int8
 
@@ -42,21 +42,34 @@ def _next_chunk(
 
 
 
-@torch.compile
+# @torch.compile
 def zeropower_via_newtonschulz5(G, steps=5):
-    assert len(G.shape) == 2
+    assert len(G.shape) in (2, 3)
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + 1e-7)
-    if G.size(0) > G.size(1):
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    if G.size(0) > G.size(1):
-        X = X.T
-    return X
+    if G.dim() == 2:
+        X /= (X.norm() + 1e-7)
+        if G.size(0) > G.size(1):
+            X = X.T
+        for _ in range(steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        if G.size(0) > G.size(1):
+            X = X.T
+        return X
+    else: # 3D Parallel Muon
+        norm = X.norm(dim=(1, 2), keepdim=True) + 1e-7
+        X = X / norm
+        if G.size(1) > G.size(2):
+            X = X.transpose(1, 2)
+        for _ in range(steps):
+            A = torch.bmm(X, X.transpose(1, 2))
+            B = b * A + c * torch.bmm(A, A)
+            X = a * X + torch.bmm(B, X)
+        if G.size(1) > G.size(2):
+            X = X.transpose(1, 2)
+        return X
 
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, momentum=0.95):
@@ -76,9 +89,12 @@ class Muon(torch.optim.Optimizer):
                     state['momentum_buffer'] = torch.zeros_like(g)
                 buf = state['momentum_buffer']
                 buf.mul_(momentum).add_(g)
-                if g.dim() == 2:
+                if g.dim() >= 2:
                     g = zeropower_via_newtonschulz5(g, steps=5)
-                g *= max(1, g.size(0)/g.size(1))**0.5
+                if g.dim() == 2:
+                    g *= max(1, g.size(0)/g.size(1))**0.5
+                elif g.dim() == 3:
+                    g *= max(1, g.size(1)/g.size(2))**0.5
                 p.data.add_(g, alpha=-lr)
 
 def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None:
@@ -105,10 +121,6 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     # ------------------------------------------------------------
     model.to(DEVICE)
     model.bfloat16()
-    # Restore CastedLinear weights to FP32 (cast to bf16 happens at matmul time)
-    for module in model.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
     # Restore small/control params to FP32 for optimizer stability
     with torch.no_grad():
         for param in model.parameters():
@@ -117,7 +129,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
 
     model.train()
 
-    compile_enabled: bool = os.environ.get("COMPILE_MODEL", "1") == "1" and DEVICE.type == "cuda"
+    compile_enabled: bool = os.environ.get('COMPILE_MODEL', '0' if dev_mode else '1') == '1' and DEVICE.type == 'cuda'
     compile_mode: str = os.environ.get("TORCH_COMPILE_MODE", "default")
     if compile_enabled:
         if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
@@ -130,10 +142,19 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
         compiled_model = model
 
     # ------------------------------------------------------------
-    # Optimizer â€” fused AdamW
+    # Optimizer — Muon (2D/3D) + AdamW (1D/Embeddings)
     # ------------------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    muon_params = []
+    adam_params = []
+    for name, p in model.named_parameters():
+        if p.ndim >= 2 and 'tok_embeddings' not in name:
+            muon_params.append(p)
+        else:
+            adam_params.append(p)
+
+    optimizer_muon = Muon(muon_params, lr=0.02, momentum=0.95)
+    optimizer_adam = torch.optim.AdamW(
+        adam_params,
         lr=train_config.learning_rate,
         fused=True,
     )
@@ -148,7 +169,8 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     # Pre-load ALL training data into pinned RAM
     # ------------------------------------------------------------
     shard_pattern: str = os.path.join(train_config.data_path, "fineweb_train_*.bin")
-    all_tokens: torch.Tensor = preload_train_tokens(shard_pattern)
+    max_shards = 1 if dev_mode else -1
+    all_tokens: torch.Tensor = preload_train_tokens(shard_pattern, max_shards=max_shards)
     token_cursor: int = 0
     total_available: int = all_tokens.numel()
 
@@ -163,7 +185,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
         steps_per_epoch = min(steps_per_epoch, 100)
         print("*** DEV_MODE: capped at 100 steps ***")
 
-    log_interval: int = 10 if dev_mode else 50
+    log_interval: int = 1 if dev_mode else 50
     lr_warmup_steps: int = max(1, int(total_steps * 0.05))
 
     def lr_lambda(step: int) -> float:
@@ -172,7 +194,8 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
         progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler_adam = torch.optim.lr_scheduler.LambdaLR(optimizer_adam, lr_lambda)
+    scheduler_muon = torch.optim.lr_scheduler.LambdaLR(optimizer_muon, lr_lambda)
 
     # ------------------------------------------------------------
     # Compiler warmup: run N throwaway steps, then reset state
@@ -204,7 +227,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
         optimizer_muon.zero_grad(set_to_none=True)
         optimizer_adam.zero_grad(set_to_none=True)
         token_cursor = 0
-        torch.cuda.synchronize()
+        if torch.cuda.is_available(): torch.cuda.synchronize()
         print("Warmup complete. Weights reset to init. Starting real training...")
 
     print(f"--- Starting La Pulga Training Loop on {DEVICE} ---")
@@ -216,7 +239,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     # ------------------------------------------------------------
     # Main training loop
     # ------------------------------------------------------------
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     for epoch in range(train_config.epochs):
         epoch_loss: float = 0.0
 
@@ -251,7 +274,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
 
             if step % log_interval == 0:
                 bpb_est: float = step_loss_float / math.log(2)
-                lr_now: float = scheduler.get_last_lr()[0]
+                lr_now: float = scheduler_adam.get_last_lr()[0]
                 print(
                     f"Epoch {epoch} | Step {step:04d}/{steps_per_epoch} | "
                     f"Loss {step_loss_float:.4f} | BPB ~{bpb_est:.4f} | "

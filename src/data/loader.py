@@ -65,7 +65,7 @@ def get_batches(
         yield inputs, targets
 
 
-def preload_train_tokens(shard_pattern: str) -> torch.Tensor:
+def preload_train_tokens(shard_pattern: str, max_shards: int = -1) -> torch.Tensor:
     """
     Pre-loads ALL training shards into a single contiguous CPU tensor.
     For 500M tokens (~1GB), this fits easily in RAM and eliminates
@@ -73,11 +73,15 @@ def preload_train_tokens(shard_pattern: str) -> torch.Tensor:
     on fast GPUs like the H100 NVL.
     """
     files = sorted(glob.glob(shard_pattern))
+    if max_shards > 0:
+        files = files[:max_shards]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {shard_pattern}")
 
     print(f"Pre-loading {len(files)} training shards into memory...")
     all_shards = [load_data_shard(Path(f)) for f in files]
-    tokens = torch.cat(all_shards).contiguous().pin_memory()
+    tokens = torch.cat(all_shards).contiguous()
+    if torch.cuda.is_available():
+        tokens = tokens.pin_memory()
     print(f"Loaded {tokens.numel():,} tokens ({tokens.numel() * 2 / 1e9:.2f} GB)")
     return tokens

@@ -10,19 +10,19 @@ Train the best language model that fits in a **16MB artifact** in under **10 min
 
 ---
 
-## 🧠 Architecture Setup (v6.0 - The "10L int6 Gated Leaky-U-Net" Record Candidate)
+## 🧠 Architecture Setup (v7.0 - The "10L Banked Parallel-Muon" Record Candidate)
 
-To respect the **16MB boundary**, *La Pulga LLM* now targets a **shared-weights ALBERT-style architecture with 15,699,158 stored parameters** and int6+zlib export. Effective depth is preserved through 4 physical layers repeated 3 times (12 effective transformer steps).
+To respect the **16MB boundary**, *La Pulga LLM* now targets a **10-layer physical architecture with ~24M parameters** using **Parameter Banking** (3D tensor stacking) and **int6 quantization** (stored as int8 + zlib). Parameter Banking reduces GPU kernel launch overhead and enables **Parallel Muon** (`torch.bmm` orthogonalization) across all layers simultaneously.
 
 | Hyperparameter | Value | Description |
 | :--- | :--- | :--- |
 | **Vocab Size (V)** | `1,024` | Official SentencePiece sp1024 vocabulary for challenge compatibility. |
-| **Dim (D)** | `768` | Core hidden dimension aligned with H100 optimization targets. |
-| **Physical Layers** | `10` | Unique parameterized blocks stored on disk. |
-| **Repeat Count** | `1` | No sharing. |
-| **Attention Heads** | `12` | 64 dimensions per head. |
+| **Dim (D)** | `512` | Core hidden dimension tuned for 10 physical layers under 16MB export. |
+| **Physical Layers** | 10 | Unique 3D banked layer slices stored on disk. |
+| **Repeat Count** | 1 | No sharing. |
+| **Attention Heads** | `8` | 64 dimensions per head. |
 | **KV Heads (GQA)** | `4` | Grouped-Query Attention to share K&V weights. |
-| **MLP Hidden** | `4096` | LeakyReLU² feed-forward width tuned to stay below 16,000,000-byte artifact limit. |
+| **MLP Hidden** | `1536` | LeakyReLU² width tuned to fit the int6+zlib 16MB constraint with 10 physical layers. |
 
 ## ⚡ Tech Stack & Optimizations
 
@@ -35,3 +35,4 @@ To respect the **16MB boundary**, *La Pulga LLM* now targets a **shared-weights 
 
 *   **/docs**: Real-time tracking of architectural mathematics, logs (`journal.md`), terminology (`glossary.md`), and historical run data (`benchmarks.md`).
 *   **`train_mlx.py`**: Our primary script for testing parameter golf locally on macOS constraints.
+

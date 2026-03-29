@@ -17,7 +17,7 @@ Develop and train **lapulga-llm** (La Pulga, named in honor of Lionel Messi for 
 Total capacity based on weight precision:
 - **16-bit (bf16/fp16):** ~8.3M parameters.
 - **8-bit (int8):** ~16.7M parameters.
-- **4-bit (int4):** ~30M parameters (**Priority strategy, 10 Layers**).
+- **6-bit (int6):** ~24M parameters (**Priority strategy, 10 Layers, Parameter Banking**).
 
 ## 📋 Architectural Guidelines for AI Agents
 🚨 **CRITICAL DIRECTIVE:** The AI Agent **MUST** read and strictly adhere to the technical and coding standards defined in **`ARCHITECTURE.md`**. This establishes the absolute laws for modular structure, enforcing clean code (SRP, PEP8), mandatory Type Hinting, and the "La Pulga" philosophy. 
@@ -25,7 +25,7 @@ Total capacity based on weight precision:
 *Baseline Parameters:*
 1. **Vocabulary Size:** Keep it small (e.g., 8k to 16k tokens) to prevent the embedding matrix from consuming too much of the 16MB budget.
 2. **Attention:** Use **Grouped-Query Attention (GQA)** or **Multi-Query Attention (MQA)** to reduce memory footprint and increase inference/training speed.
-3. **Layer Depth:** Using 10 distinct physical layers. ALBERT-style sharing is banned as it wastes FLOPs and step time on H100s without improving capacity.
+3. **Layer Depth & Parameter Banking:** Using 10 distinct physical layers stacked into 3D Parameter Banks. This minimizes GPU Kernel Launch Overhead and enables the Parallel Muon optimizer via `torch.bmm`. ALBERT-style sharing is banned.
 4. **Data:** Focus on high-quality synthetic datasets like *TinyStories* or *Cosmopedia*. Data cleaning and filtering are more important than volume given the 10-minute window.
 
 ## 📚 Knowledge Management & Documentation
