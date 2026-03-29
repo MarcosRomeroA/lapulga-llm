@@ -10,6 +10,7 @@ import zlib
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 INT8_KEEP_FLOAT_MAX_NUMEL: int = 16_384

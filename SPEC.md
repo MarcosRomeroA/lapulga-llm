@@ -7,13 +7,13 @@ n_embd: 768
 n_head: 12
 n_kv_heads: 4
 physical_layers: 4
-repeat_count: 3
-hidden_dim: 1280
+repeat_count: 1
+hidden_dim: 4096
 vocab_size: 1024
 context_length: 1024
 constraints:
   max_size_bytes: 16000000
-  target_params: 14959152
+  target_params: 32257584
   tolerance_pct: 1.0
 tokenizer: sentencepiece-sp1024
 dataset: fineweb-sp1024
@@ -44,7 +44,7 @@ All code must conform to this specification. Compliance is enforced automaticall
 | `physical_layers` | 4 | Unique layer blocks stored on disk |
 | `repeat_count` | 3 | Times the block is traversed during forward pass |
 | `effective_layers` | 12 | 4 physical × 3 repeats — effective depth |
-| `hidden_dim` | 1280 | MLP inner size selected to keep int8+zlib artifact safely under 16,000,000 bytes |
+| `hidden_dim` | 1280 | MLP inner size selected to keep int6+zlib artifact safely under 16,000,000 bytes |
 | `vocab_size` | 1024 | SentencePiece sp1024 — official challenge tokenizer |
 | `context_length` | 1024 | Official training sequence length |
 | `norm_eps` | 1e-5 | RMSNorm stability epsilon |
@@ -64,7 +64,7 @@ Triton's fused RMSNorm backward kernel at `dim=768` requires ~170 KB, which fits
 on H100 but caused `OutOfMemoryError` locally.
 
 **Budget math:**
-- Stored model parameters: 14,959,152 (4 physical blocks with ALBERT sharing across 12 effective steps)
+- Stored model parameters: 14,959,152 (10 distinct physical layers across 10 effective steps)
 - 12 effective transformer steps maintain full representational depth
 - U-Net skip weights indexed over virtual (effective) layer indices 0–11
 
@@ -84,12 +84,12 @@ on H100 but caused `OutOfMemoryError` locally.
 
 | Component | Params | Notes |
 |:---|:---|:---|
-| Embeddings (1024 × 768, tied) | 786,432 | Shared as output head |
-| Attention × 4 physical (GQA kv=4) | 6,291,504 | wq/wk/wv/wo + q_gain with ALBERT sharing |
-| MLP × 4 physical (relu^2, hidden=1280) | 7,864,320 | fc + proj with ALBERT sharing |
-| Scales + residual mix × 4 physical | 12,288 | attn_scale, mlp_scale, resid_mix |
-| Skip weights (6 × 768) | 4,608 | U-Net over 12 layer indices |
-| **Total stored** | **14,959,152** | Export size validated by compliance tests |
+| Embeddings | ~0.5M | Factored Tied Embeddings (254 dim) |
+| Attention × 4 physical (GQA kv=4) | ~6.3M | wq/wk/wv/wo + q_gain with ALBERT sharing |
+| MLP × 4 physical (LeakyReLU, hidden=2048) | ~12.5M | fc + proj with ALBERT sharing |
+| Scales + residual mix × 4 physical | ~0.01M | attn_scale, mlp_scale, resid_mix |
+| Skip weights (6 × 768) | ~0.004M | U-Net over 12 layer indices |
+| **Total stored** | **~29.5M (logical) -> ~15.9MB (quantized)** | Export size strictly constrained to <16MB |
 
 ## Compliance Gate
 

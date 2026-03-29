@@ -104,18 +104,53 @@ class Attention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        try:
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                is_causal=True,
-                enable_gqa=(self.n_kv_heads != self.n_heads),
-            )
-        except TypeError:
-            if self.n_kv_heads != self.n_heads:
-                repeat_factor = self.n_heads // self.n_kv_heads
-                k = k.repeat_interleave(repeat_factor, dim=1)
-                v = v.repeat_interleave(repeat_factor, dim=1)
+        # Efficient Partial XSA: if xsa_layer, we normalize v and subtract the projection
+        if getattr(self, "xsa_layer", False):
+            # Normalizamos v
+            v_norm = F.normalize(v, dim=-1)
+            try:
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=True,
+                    enable_gqa=(self.n_kv_heads != self.n_heads),
+                )
+                
+                # GQA-aware XSA sin duplicar memoria
+                y_grouped = y.view(B, self.n_kv_heads, self.n_heads // self.n_kv_heads, T, self.head_dim)
+                v_norm_expanded = v_norm.unsqueeze(2) # [B, Hkv, 1, T, D]
+                proj = (y_grouped * v_norm_expanded).sum(dim=-1, keepdim=True) * v_norm_expanded
+                output = (y_grouped - proj).view(B, self.n_heads, T, self.head_dim)
+                
+            except TypeError:
+                if self.n_kv_heads != self.n_heads:
+                    repeat_factor = self.n_heads // self.n_kv_heads
+                    k = k.repeat_interleave(repeat_factor, dim=1)
+                    v = v.repeat_interleave(repeat_factor, dim=1)
+                
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=True,
+                )
+                
+                # Standard XSA para MHA
+                v_norm = F.normalize(v, dim=-1)
+                proj = (y * v_norm).sum(dim=-1, keepdim=True) * v_norm
+                output = y - proj
+        else:
+            try:
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=True,
+                    enable_gqa=(self.n_kv_heads != self.n_heads),
+                )
+            except TypeError:
+                if self.n_kv_heads != self.n_heads:
+                    repeat_factor = self.n_heads // self.n_kv_heads
+                    k = k.repeat_interleave(repeat_factor, dim=1)
+                    v = v.repeat_interleave(repeat_factor, dim=1)
             output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
@@ -183,7 +218,12 @@ class LanguageModel(nn.Module):
         self.vocab_size: int = config.vocab_size
         self.logit_softcap: float = config.logit_softcap
 
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        # Factored Tied Embeddings
+        # We need self.tok_embeddings output to be [B, T, embed_dim]
+        # Then embed_proj maps [B, T, embed_dim] -> [B, T, dim]
+        self.tok_embeddings = nn.Embedding(config.vocab_size, getattr(config, "embed_dim", config.dim))
+        self.embed_proj = nn.Linear(getattr(config, "embed_dim", config.dim), config.dim, bias=False) if getattr(config, "embed_dim", config.dim) != config.dim else nn.Identity()
+        self.output_proj = nn.Linear(config.dim, getattr(config, "embed_dim", config.dim), bias=False) if getattr(config, "embed_dim", config.dim) != config.dim else nn.Identity()
 
         # U-Net skip connections indexed over effective (virtual) layer depth
         num_encoder: int = config.effective_layers // 2
@@ -195,6 +235,11 @@ class LanguageModel(nn.Module):
 
         # Physical layers — only these hold unique parameters
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.physical_layers)])
+        
+        # Mark the last 2 physical layers for Exclusive Self-Attention (XSA)
+        if config.physical_layers >= 2:
+            for i in range(config.physical_layers - 2, config.physical_layers):
+                self.layers[i].attention.xsa_layer = True
 
         # UNROLLED sequence: repeated references to the physical layers.
         # torch.compile sees 12 linear calls, NOT a Python loop.
@@ -216,6 +261,10 @@ class LanguageModel(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> Tensor:
         x = self.tok_embeddings(input_ids)
+        if isinstance(self.embed_proj, nn.Linear):
+            x = self.embed_proj(x)
+        if isinstance(self.embed_proj, nn.Linear):
+            x = self.embed_proj(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []

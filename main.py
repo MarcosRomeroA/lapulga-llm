@@ -3,6 +3,11 @@ Entrypoint for lapulga-llm.
 Trains on FineWeb shards, evaluates with BPB, and reports artifact size.
 """
 import os
+try:
+    import dotenv
+    dotenv.load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed, assuming env vars are set externally
 import torch
 from pathlib import Path
 from src.domain.config import ModelConfig, TrainingConfig

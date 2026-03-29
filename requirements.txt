@@ -1,0 +1,5 @@
+-r ../parameter-golf/requirements.txt
+tokenizers>=0.22.2
+safetensors>=0.4.0
+runpod>=1.7.0
+python-dotenv

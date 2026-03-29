@@ -32,11 +32,12 @@ from dataclasses import dataclass
 class ModelConfig:
     """Configuration schema for the La Pulga Transformer architecture."""
     dim: int = 768
+    embed_dim: int = 768  # Factored embedding to save bytes
     physical_layers: int = 4
-    repeat_count: int = 3
+    repeat_count: int = 1
     n_heads: int = 12
     n_kv_heads: int = 4
-    hidden_dim: int = 1280
+    hidden_dim: int = 4096
     vocab_size: int = 1024
     norm_eps: float = 1e-5
     context_length: int = 1024
@@ -160,18 +161,53 @@ class Attention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        try:
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                is_causal=True,
-                enable_gqa=(self.n_kv_heads != self.n_heads),
-            )
-        except TypeError:
-            if self.n_kv_heads != self.n_heads:
-                repeat_factor = self.n_heads // self.n_kv_heads
-                k = k.repeat_interleave(repeat_factor, dim=1)
-                v = v.repeat_interleave(repeat_factor, dim=1)
+        # Efficient Partial XSA: if xsa_layer, we normalize v and subtract the projection
+        if getattr(self, "xsa_layer", False):
+            # Normalizamos v
+            v_norm = F.normalize(v, dim=-1)
+            try:
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=True,
+                    enable_gqa=(self.n_kv_heads != self.n_heads),
+                )
+                
+                # GQA-aware XSA sin duplicar memoria
+                y_grouped = y.view(B, self.n_kv_heads, self.n_heads // self.n_kv_heads, T, self.head_dim)
+                v_norm_expanded = v_norm.unsqueeze(2) # [B, Hkv, 1, T, D]
+                proj = (y_grouped * v_norm_expanded).sum(dim=-1, keepdim=True) * v_norm_expanded
+                output = (y_grouped - proj).view(B, self.n_heads, T, self.head_dim)
+                
+            except TypeError:
+                if self.n_kv_heads != self.n_heads:
+                    repeat_factor = self.n_heads // self.n_kv_heads
+                    k = k.repeat_interleave(repeat_factor, dim=1)
+                    v = v.repeat_interleave(repeat_factor, dim=1)
+                
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=True,
+                )
+                
+                # Standard XSA para MHA
+                v_norm = F.normalize(v, dim=-1)
+                proj = (y * v_norm).sum(dim=-1, keepdim=True) * v_norm
+                output = y - proj
+        else:
+            try:
+                output = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    is_causal=True,
+                    enable_gqa=(self.n_kv_heads != self.n_heads),
+                )
+            except TypeError:
+                if self.n_kv_heads != self.n_heads:
+                    repeat_factor = self.n_heads // self.n_kv_heads
+                    k = k.repeat_interleave(repeat_factor, dim=1)
+                    v = v.repeat_interleave(repeat_factor, dim=1)
             output = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
@@ -239,7 +275,12 @@ class LanguageModel(nn.Module):
         self.vocab_size: int = config.vocab_size
         self.logit_softcap: float = config.logit_softcap
 
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        # Factored Tied Embeddings
+        # We need self.tok_embeddings output to be [B, T, embed_dim]
+        # Then embed_proj maps [B, T, embed_dim] -> [B, T, dim]
+        self.tok_embeddings = nn.Embedding(config.vocab_size, getattr(config, "embed_dim", config.dim))
+        self.embed_proj = nn.Linear(getattr(config, "embed_dim", config.dim), config.dim, bias=False) if getattr(config, "embed_dim", config.dim) != config.dim else nn.Identity()
+        self.output_proj = nn.Linear(config.dim, getattr(config, "embed_dim", config.dim), bias=False) if getattr(config, "embed_dim", config.dim) != config.dim else nn.Identity()
 
         # U-Net skip connections indexed over effective (virtual) layer depth
         num_encoder: int = config.effective_layers // 2
@@ -251,6 +292,11 @@ class LanguageModel(nn.Module):
 
         # Physical layers — only these hold unique parameters
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.physical_layers)])
+        
+        # Mark the last 2 physical layers for Exclusive Self-Attention (XSA)
+        if config.physical_layers >= 2:
+            for i in range(config.physical_layers - 2, config.physical_layers):
+                self.layers[i].attention.xsa_layer = True
 
         # UNROLLED sequence: repeated references to the physical layers.
         # torch.compile sees 12 linear calls, NOT a Python loop.
@@ -272,6 +318,10 @@ class LanguageModel(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> Tensor:
         x = self.tok_embeddings(input_ids)
+        if isinstance(self.embed_proj, nn.Linear):
+            x = self.embed_proj(x)
+        if isinstance(self.embed_proj, nn.Linear):
+            x = self.embed_proj(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -484,6 +534,7 @@ import zlib
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 INT8_KEEP_FLOAT_MAX_NUMEL: int = 16_384
@@ -801,6 +852,46 @@ def _next_chunk(
     return chunk, token_cursor + (need - 1)
 
 
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=5):
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + 1e-7)
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.95):
+        defaults = dict(lr=lr, momentum=momentum)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if g.dim() == 2:
+                    g = zeropower_via_newtonschulz5(g, steps=5)
+                g *= max(1, g.size(0)/g.size(1))**0.5
+                p.data.add_(g, alpha=-lr)
+
 def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None:
     """
     Executes the main optimization loop on FineWeb shards.
@@ -898,10 +989,11 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     if warmup_steps_count > 0:
         print(f"Running {warmup_steps_count} compiler warmup steps (state will be reset)...")
         initial_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        initial_optimizer_state = copy.deepcopy(optimizer.state_dict())
+        initial_optimizer_state = (copy.deepcopy(optimizer_muon.state_dict()), copy.deepcopy(optimizer_adam.state_dict()))
 
         for _ in range(warmup_steps_count):
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_adam.zero_grad(set_to_none=True)
             for _ in range(accum_steps):
                 need = micro_tokens + 1
                 chunk, token_cursor = _next_chunk(all_tokens, token_cursor, need, total_available)
@@ -910,12 +1002,15 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
                 with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                     loss = compiled_model(x, y)
                 (loss * grad_scale).backward()
-            optimizer.step()
+            optimizer_muon.step()
+            optimizer_adam.step()
 
         # Reset to true initial state — timer starts here
         model.load_state_dict(initial_model_state, strict=True)
-        optimizer.load_state_dict(initial_optimizer_state)
-        optimizer.zero_grad(set_to_none=True)
+        optimizer_muon.load_state_dict(initial_optimizer_state[0])
+        optimizer_adam.load_state_dict(initial_optimizer_state[1])
+        optimizer_muon.zero_grad(set_to_none=True)
+        optimizer_adam.zero_grad(set_to_none=True)
         token_cursor = 0
         torch.cuda.synchronize()
         print("Warmup complete. Weights reset to init. Starting real training...")
@@ -936,7 +1031,8 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
         for step in range(steps_per_epoch):
             t0: float = time.perf_counter()
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_adam.zero_grad(set_to_none=True)
             step_loss = torch.zeros((), device=DEVICE)
 
             for _ in range(accum_steps):
@@ -951,8 +1047,10 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
                 step_loss += loss.detach()
                 (loss * grad_scale).backward()
 
-            optimizer.step()
-            scheduler.step()
+            optimizer_muon.step()
+            optimizer_adam.step()
+            scheduler_adam.step()
+            scheduler_muon.step()
 
             # Single GPU→CPU sync per step
             step_loss_float: float = (step_loss / accum_steps).item()

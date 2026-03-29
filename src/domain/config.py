@@ -9,11 +9,13 @@ from dataclasses import dataclass
 class ModelConfig:
     """Configuration schema for the La Pulga Transformer architecture."""
     dim: int = 768
+    embed_dim: int = 768  # Factored embedding to save bytes
     physical_layers: int = 4
-    repeat_count: int = 3
+    repeat_count: int = 1
     n_heads: int = 12
     n_kv_heads: int = 4
-    hidden_dim: int = 1280
+    hidden_dim: int = 2048
+    n_banks: int = 4  # Parameter banking experts
     vocab_size: int = 1024
     norm_eps: float = 1e-5
     context_length: int = 1024

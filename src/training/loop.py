@@ -41,6 +41,46 @@ def _next_chunk(
     return chunk, token_cursor + (need - 1)
 
 
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=5):
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + 1e-7)
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, momentum=0.95):
+        defaults = dict(lr=lr, momentum=momentum)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if g.dim() == 2:
+                    g = zeropower_via_newtonschulz5(g, steps=5)
+                g *= max(1, g.size(0)/g.size(1))**0.5
+                p.data.add_(g, alpha=-lr)
+
 def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None:
     """
     Executes the main optimization loop on FineWeb shards.
@@ -80,6 +120,9 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     compile_enabled: bool = os.environ.get("COMPILE_MODEL", "1") == "1" and DEVICE.type == "cuda"
     compile_mode: str = os.environ.get("TORCH_COMPILE_MODE", "default")
     if compile_enabled:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+            print("Detected pre-Ampere GPU (e.g. RTX 20/30 series). Forcing compile_mode='default' to prevent Triton autotune crashes.")
+            compile_mode = "default"
         print(f"Compiling model (torch.compile, mode={compile_mode})...")
         compiled_model = torch.compile(model, mode=compile_mode)
     else:
@@ -138,10 +181,11 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     if warmup_steps_count > 0:
         print(f"Running {warmup_steps_count} compiler warmup steps (state will be reset)...")
         initial_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        initial_optimizer_state = copy.deepcopy(optimizer.state_dict())
+        initial_optimizer_state = (copy.deepcopy(optimizer_muon.state_dict()), copy.deepcopy(optimizer_adam.state_dict()))
 
         for _ in range(warmup_steps_count):
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_adam.zero_grad(set_to_none=True)
             for _ in range(accum_steps):
                 need = micro_tokens + 1
                 chunk, token_cursor = _next_chunk(all_tokens, token_cursor, need, total_available)
@@ -150,12 +194,15 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
                 with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
                     loss = compiled_model(x, y)
                 (loss * grad_scale).backward()
-            optimizer.step()
+            optimizer_muon.step()
+            optimizer_adam.step()
 
         # Reset to true initial state — timer starts here
         model.load_state_dict(initial_model_state, strict=True)
-        optimizer.load_state_dict(initial_optimizer_state)
-        optimizer.zero_grad(set_to_none=True)
+        optimizer_muon.load_state_dict(initial_optimizer_state[0])
+        optimizer_adam.load_state_dict(initial_optimizer_state[1])
+        optimizer_muon.zero_grad(set_to_none=True)
+        optimizer_adam.zero_grad(set_to_none=True)
         token_cursor = 0
         torch.cuda.synchronize()
         print("Warmup complete. Weights reset to init. Starting real training...")
@@ -176,7 +223,8 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
         for step in range(steps_per_epoch):
             t0: float = time.perf_counter()
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_adam.zero_grad(set_to_none=True)
             step_loss = torch.zeros((), device=DEVICE)
 
             for _ in range(accum_steps):
@@ -191,8 +239,10 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
                 step_loss += loss.detach()
                 (loss * grad_scale).backward()
 
-            optimizer.step()
-            scheduler.step()
+            optimizer_muon.step()
+            optimizer_adam.step()
+            scheduler_adam.step()
+            scheduler_muon.step()
 
             # Single GPU→CPU sync per step
             step_loss_float: float = (step_loss / accum_steps).item()

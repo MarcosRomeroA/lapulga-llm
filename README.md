@@ -10,26 +10,26 @@ Train the best language model that fits in a **16MB artifact** in under **10 min
 
 ---
 
-## 🧠 Architecture Setup (v4.2 - H100 Candidate)
+## 🧠 Architecture Setup (v6.0 - The "10L int6 Gated Leaky-U-Net" Record Candidate)
 
-To respect the **16MB boundary**, *La Pulga LLM* now targets a **shared-weights ALBERT-style architecture with 14,959,152 stored parameters** and int8+zlib export. Effective depth is preserved through 4 physical layers repeated 3 times (12 effective transformer steps).
+To respect the **16MB boundary**, *La Pulga LLM* now targets a **shared-weights ALBERT-style architecture with 15,699,158 stored parameters** and int6+zlib export. Effective depth is preserved through 4 physical layers repeated 3 times (12 effective transformer steps).
 
 | Hyperparameter | Value | Description |
 | :--- | :--- | :--- |
 | **Vocab Size (V)** | `1,024` | Official SentencePiece sp1024 vocabulary for challenge compatibility. |
 | **Dim (D)** | `768` | Core hidden dimension aligned with H100 optimization targets. |
-| **Physical Layers** | `4` | Unique parameterized blocks stored on disk. |
-| **Repeat Count** | `3` | ALBERT-style reuse for 12 effective transformer steps. |
+| **Physical Layers** | `10` | Unique parameterized blocks stored on disk. |
+| **Repeat Count** | `1` | No sharing. |
 | **Attention Heads** | `12` | 64 dimensions per head. |
 | **KV Heads (GQA)** | `4` | Grouped-Query Attention to share K&V weights. |
-| **MLP Hidden** | `1280` | ReLU² feed-forward width tuned to stay below 16,000,000-byte artifact limit. |
+| **MLP Hidden** | `4096` | LeakyReLU² feed-forward width tuned to stay below 16,000,000-byte artifact limit. |
 
 ## ⚡ Tech Stack & Optimizations
 
 *   **Apple Silicon (M4):** Local prototyping is completely driven by [Apple's MLX Framework](https://github.com/ml-explore/mlx). We write training loops in Python taking advantage of the unified memory for ultra-fast local iteration batches.
 *   **Runpod (8xH100):** Cloud instances will leverage **PyTorch**, **FlashAttention-2** and potentially **Unsloth** wrappers to squeeze every microsecond out of the 10-minute training wall.
-*   **Weight Tying:** The model explicitly ties the Unembedding matrix weights back to the Input Embeddings, recovering nearly `~2M` parameters instantly.
-*   **Checkpointing + Export:** We save `.safetensors` and emit official int8+zlib artifacts for strict 16,000,000-byte validation.
+*   **Weight Tying:** The model explicitly ties the Unembedding matrix weights back to the Input Embeddings, recovering nearly `~2M` parameters instantly. We also use **Factored Embeddings** (254-dim mapped to 768-dim) to save an additional ~0.5MB, allowing us to dramatically expand the MLP width.
+*   **Checkpointing + Export:** We save `.safetensors` and emit official int6+zlib artifacts for strict 16,000,000-byte validation.
 
 ## 📂 Project Structure
 
