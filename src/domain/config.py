@@ -13,7 +13,7 @@ class ModelConfig:
     repeat_count: int = 3
     n_heads: int = 12
     n_kv_heads: int = 4
-    hidden_dim: int = 3584
+    hidden_dim: int = 1280
     vocab_size: int = 1024
     norm_eps: float = 1e-5
     context_length: int = 1024
@@ -36,6 +36,6 @@ class TrainingConfig:
     train_tokens: int = 500_000_000
     val_tokens: int = 50_000
     checkpoint_path: str = "lapulga_weights.safetensors"
-    tokenizer_path: str = "data/tokenizers/fineweb_1024_bpe.model"
-    data_path: str = "data/datasets/fineweb10B_sp1024"
+    tokenizer_path: str = "../parameter-golf/data/tokenizers/fineweb_1024_bpe.model"
+    data_path: str = "../parameter-golf/data/datasets/fineweb10B_sp1024"
     scoring_metric: str = "bpb"

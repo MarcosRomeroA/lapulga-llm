@@ -17,27 +17,27 @@ REP_PENALTY ?= 1.2
 
 ## Run the full training + BPB evaluation pipeline
 run:
-	PYTHONUNBUFFERED=1 uv run main.py
+	PYTHONUNBUFFERED=1 python main.py
 
 ## Generate text from saved checkpoint
 generate:
-	PYTHONPATH=. PYTHONUNBUFFERED=1 uv run scripts/infer.py --prompt "$(PROMPT)" --max-tokens $(MAX_TOKENS) --temperature $(TEMPERATURE) --top-k $(TOP_K) --repetition-penalty $(REP_PENALTY)
+	PYTHONPATH=. PYTHONUNBUFFERED=1 python scripts/infer.py --prompt "$(PROMPT)" --max-tokens $(MAX_TOKENS) --temperature $(TEMPERATURE) --top-k $(TOP_K) --repetition-penalty $(REP_PENALTY)
 
 ## Run all tests (spec compliance + official scoring)
 test:
-	uv run pytest tests/ -v
+	python -m pytest tests/ -v
 
 ## Run only the official scoring mock tests
 test-scoring:
-	uv run pytest tests/test_official_scoring.py -v
+	python -m pytest tests/test_official_scoring.py -v
 
 ## Download FineWeb shards (default: 10 train shards)
 download-data:
-	uv run python data/download_fineweb.py --variant sp1024 --train-shards $(SHARDS)
+	python ../parameter-golf/data/cached_challenge_fineweb.py --variant sp1024
 
 ## Start RunPod, train, download artifacts, stop Pod (zero-click)
 run-cloud:
-	@PYTHONUNBUFFERED=1 uv run scripts/runpod_orchestrator.py
+	@PYTHONUNBUFFERED=1 python scripts/runpod_orchestrator.py
 
 ## Show available commands
 help:
@@ -49,7 +49,7 @@ help:
 	@echo "  make generate PROMPT=\"The dog\" MAX_TOKENS=150 TOP_K=50 REP_PENALTY=1.2"
 	@echo "  make test             Run all tests (compliance + scoring)"
 	@echo "  make test-scoring     Run official scoring mock tests only"
-	@echo "  make download-data    Download FineWeb shards (SHARDS=10)"
-	@echo "  make download-data SHARDS=1   Download 1 shard (smoke test)"
+	@echo "  make download-data    Download FineWeb cache via ../parameter-golf"
+	@echo "  (uses default settings from parameter-golf cached_challenge_fineweb.py)"
 	@echo "  make run-cloud        Start RunPod, train, download artifacts, stop Pod"
 	@echo ""

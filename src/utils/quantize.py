@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-INT8_KEEP_FLOAT_MAX_NUMEL: int = 65_536
+INT8_KEEP_FLOAT_MAX_NUMEL: int = 16_384
 INT8_KEEP_FLOAT_STORE_DTYPE: torch.dtype = torch.float16
 INT8_PER_ROW_SCALE_DTYPE: torch.dtype = torch.float16
 INT8_CLIP_PERCENTILE: float = 99.99984

@@ -17,10 +17,11 @@ import sentencepiece as spm
 import io
 import zlib
 import math
+import copy
 import os
 import time
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 from safetensors.torch import save_file as safetensors_save
-import torch._inductor.config as inductor_cfg
 
 # ── domain.config ──────────────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ class ModelConfig:
     repeat_count: int = 3
     n_heads: int = 12
     n_kv_heads: int = 4
-    hidden_dim: int = 3072
+    hidden_dim: int = 1280
     vocab_size: int = 1024
     norm_eps: float = 1e-5
     context_length: int = 1024
@@ -51,15 +52,15 @@ class ModelConfig:
 class TrainingConfig:
     """Configuration schema for the training orchestration."""
     batch_size: int = 524288
-    micro_batch_size: int = 16384
+    micro_batch_size: int = 131072
     context_length: int = 1024
     learning_rate: float = 6e-4
     epochs: int = 1
     train_tokens: int = 500_000_000
     val_tokens: int = 50_000
     checkpoint_path: str = "lapulga_weights.safetensors"
-    tokenizer_path: str = "data/tokenizers/fineweb_1024_bpe.model"
-    data_path: str = "data/datasets/fineweb10B_sp1024"
+    tokenizer_path: str = "../parameter-golf/data/tokenizers/fineweb_1024_bpe.model"
+    data_path: str = "../parameter-golf/data/datasets/fineweb10B_sp1024"
     scoring_metric: str = "bpb"
 
 # ── model.transformer ──────────────────────────────────────────────────────
@@ -68,49 +69,51 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
 from typing import Optional
 
 DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+class CastedLinear(nn.Linear):
+    """
+    Keeps weights in FP32 for optimizer precision, casts to input dtype at matmul time.
+    Under torch.autocast(bf16), the .to(x.dtype) is essentially free.
+    Matches the official parameter-golf baseline pattern.
+    """
+    def forward(self, x: Tensor) -> Tensor:
+        return F.linear(x, self.weight.to(x.dtype), self.bias.to(x.dtype) if self.bias is not None else None)
 
-    def forward(self, input_tensor: Tensor) -> Tensor:
-        return F.rms_norm(input_tensor, (self.dim,), self.weight, self.eps)
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (no learnable weight for compile compat)."""
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
 class Rotary(nn.Module):
     """
-    Rotary Position Embeddings with cached cos/sin tables.
-    Caches are rebuilt when sequence length or device changes.
+    Rotary Position Embeddings with pre-computed cos/sin tables.
+    Tables are computed once at init for the fixed context_length,
+    stored as buffers (no mutation during forward — torch.compile safe).
     """
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, max_seq_len: int = 1024, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached: int = 0
-        self._cos_cached: Optional[Tensor] = None
-        self._sin_cached: Optional[Tensor] = None
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer("cos_table", freqs.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_table", freqs.sin()[None, None, :, :], persistent=False)
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        if (
-            self._cos_cached is None
-            or self._sin_cached is None
-            or self._seq_len_cached != seq_len
-            or self._cos_cached.device != device
-        ):
-            positions = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(positions, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        return (
+            self.cos_table[:, :, :seq_len, :].to(dtype=dtype),
+            self.sin_table[:, :, :seq_len, :].to(dtype=dtype),
+        )
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -132,10 +135,10 @@ class Attention(nn.Module):
         self.head_dim: int = config.dim // config.n_heads
         kv_dim: int = self.n_kv_heads * self.head_dim
 
-        self.wq = nn.Linear(config.dim, config.dim, bias=False)
-        self.wk = nn.Linear(config.dim, kv_dim, bias=False)
-        self.wv = nn.Linear(config.dim, kv_dim, bias=False)
-        self.wo = nn.Linear(config.dim, config.dim, bias=False)
+        self.wq = CastedLinear(config.dim, config.dim, bias=False)
+        self.wk = CastedLinear(config.dim, kv_dim, bias=False)
+        self.wv = CastedLinear(config.dim, kv_dim, bias=False)
+        self.wo = CastedLinear(config.dim, config.dim, bias=False)
         self.wo._zero_init = True
 
         self.q_gain = nn.Parameter(torch.full((config.n_heads,), 1.0, dtype=torch.float32))
@@ -157,12 +160,23 @@ class Attention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.n_kv_heads != self.n_heads),
-        )
+        try:
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.n_kv_heads != self.n_heads),
+            )
+        except TypeError:
+            if self.n_kv_heads != self.n_heads:
+                repeat_factor = self.n_heads // self.n_kv_heads
+                k = k.repeat_interleave(repeat_factor, dim=1)
+                v = v.repeat_interleave(repeat_factor, dim=1)
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=True,
+            )
         output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_length, -1)
         return self.wo(output)
 
@@ -174,8 +188,8 @@ class MLP(nn.Module):
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.fc = nn.Linear(config.dim, config.hidden_dim, bias=False)
-        self.proj = nn.Linear(config.hidden_dim, config.dim, bias=False)
+        self.fc = CastedLinear(config.dim, config.hidden_dim, bias=False)
+        self.proj = CastedLinear(config.hidden_dim, config.dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, input_tensor: Tensor) -> Tensor:
@@ -193,8 +207,8 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.attention = Attention(config)
         self.feed_forward = MLP(config)
-        self.attention_norm = RMSNorm(config.dim, config.norm_eps)
-        self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
+        self.attention_norm = RMSNorm()
+        self.ffn_norm = RMSNorm()
         self.attn_scale = nn.Parameter(torch.ones(config.dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(config.dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(
@@ -216,13 +230,8 @@ class LanguageModel(nn.Module):
     La Pulga — Fat ALBERT variant for H100.
 
     ALBERT-style Cross-Layer Sharing: 4 physical blocks repeated 3× = 12 effective layers.
-    At dim=768 the H100's 228KB L1 shared memory easily fits fused RMSNorm backward kernels
-    (vs the RTX 3090's 101KB limit which forced dim=512).
-
-    Budget breakdown (stored params ~26M, artifact ~12MB int8+zlib):
-    - 4 physical layers × ~6.3M params/layer = ~25.2M
-    - Embeddings 1024×768 (tied as output head)  = 0.79M
-    - Skip weights 6×768 + final norm             = ~5K
+    The ALBERT loop is UNROLLED into self.full_sequence for torch.compile compatibility.
+    Modules are repeated references (shared weights), so param count stays the same.
     """
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -240,9 +249,18 @@ class LanguageModel(nn.Module):
             torch.ones(self.num_skip_weights, config.dim, dtype=torch.float32)
         )
 
-        # Only physical_layers unique blocks stored — shared across repeats
+        # Physical layers — only these hold unique parameters
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.physical_layers)])
-        self.norm = RMSNorm(config.dim, config.norm_eps)
+
+        # UNROLLED sequence: repeated references to the physical layers.
+        # torch.compile sees 12 linear calls, NOT a Python loop.
+        # Weights are shared — self.full_sequence[0] IS self.layers[0].
+        self.full_sequence = nn.ModuleList()
+        for _ in range(config.repeat_count):
+            for layer in self.layers:
+                self.full_sequence.append(layer)
+
+        self.norm = RMSNorm()
 
         self._init_weights()
 
@@ -259,27 +277,24 @@ class LanguageModel(nn.Module):
         skips: list[Tensor] = []
 
         num_encoder: int = self.config.effective_layers // 2
-        virtual_idx: int = 0
         decoder_step: int = 0
 
-        # ALBERT loop: traverse the 4 physical blocks repeat_count times
-        for _ in range(self.config.repeat_count):
-            for layer in self.layers:
-                if virtual_idx < num_encoder:
-                    x = layer(x, x0)
-                    skips.append(x)
-                else:
-                    if skips:
-                        sw = self.skip_weights[decoder_step].to(dtype=x.dtype)[None, None, :]
-                        x = x + sw * skips.pop()
-                    x = layer(x, x0)
-                    decoder_step += 1
-                virtual_idx += 1
+        # Unrolled linear sequence — clean path, no branches
+        for virtual_idx, block in enumerate(self.full_sequence):
+            if virtual_idx < num_encoder:
+                x = block(x, x0)
+                skips.append(x)
+            else:
+                if skips:
+                    sw = self.skip_weights[decoder_step].to(dtype=x.dtype)[None, None, :]
+                    x = x + sw * skips.pop()
+                x = block(x, x0)
+                decoder_step += 1
 
         x = self.norm(x)
 
         # Weight Tying: reuse tok_embeddings.weight as the output head
-        logits = F.linear(x, self.tok_embeddings.weight)
+        logits = F.linear(x, self.tok_embeddings.weight.to(x.dtype))
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
 
         if target_ids is not None:
@@ -471,7 +486,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-INT8_KEEP_FLOAT_MAX_NUMEL: int = 65_536
+INT8_KEEP_FLOAT_MAX_NUMEL: int = 16_384
 INT8_KEEP_FLOAT_STORE_DTYPE: torch.dtype = torch.float16
 INT8_PER_ROW_SCALE_DTYPE: torch.dtype = torch.float16
 INT8_CLIP_PERCENTILE: float = 99.99984
@@ -759,6 +774,7 @@ def generate_text(
 
 # ── training.loop ──────────────────────────────────────────────────────────
 
+import copy
 import io
 import math
 import os
@@ -766,114 +782,206 @@ import time
 import zlib
 
 import torch
+import torch.nn.functional as F
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 from safetensors.torch import save_file as safetensors_save
+
+DEFAULT_COMPILE_WARMUP_STEPS: int = 8
+
+
+def _next_chunk(
+    all_tokens: torch.Tensor,
+    token_cursor: int,
+    need: int,
+    total_available: int,
+) -> tuple[torch.Tensor, int]:
+    if token_cursor + need > total_available:
+        token_cursor = 0
+    chunk = all_tokens[token_cursor : token_cursor + need]
+    return chunk, token_cursor + (need - 1)
 
 
 def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None:
     """
     Executes the main optimization loop on FineWeb shards.
-    Trains in FP32 (with AMP on CUDA), then exports via int8+zlib.
+    All training data is pre-loaded into RAM to eliminate I/O bottlenecks.
+    Uses CastedLinear (FP32 weights) and torch.compile(max-autotune).
     """
     dev_mode: bool = os.environ.get("DEV_MODE", "0") == "1"
 
+    # ------------------------------------------------------------
+    # CUDA Knobs — match official baseline
+    # ------------------------------------------------------------
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
+
+    # ------------------------------------------------------------
+    # Model setup: bf16 body, FP32 CastedLinear weights + scalars
+    # Matches official parameter-golf pattern for optimizer precision.
+    # ------------------------------------------------------------
     model.to(DEVICE)
+    model.bfloat16()
+    # Restore CastedLinear weights to FP32 (cast to bf16 happens at matmul time)
+    for module in model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    # Restore small/control params to FP32 for optimizer stability
+    with torch.no_grad():
+        for param in model.parameters():
+            if param.ndim < 2 and param.dtype != torch.float32:
+                param.data = param.data.float()
+
     model.train()
 
-    # torch.compile disabled: Triton exceeds RTX 3090 shared memory limit
-    # during backward pass compilation of fused RMSNorm kernels.
-    compiled_model = model
+    compile_enabled: bool = os.environ.get("COMPILE_MODEL", "1") == "1" and DEVICE.type == "cuda"
+    compile_mode: str = os.environ.get("TORCH_COMPILE_MODE", "default")
+    if compile_enabled:
+        print(f"Compiling model (torch.compile, mode={compile_mode})...")
+        compiled_model = torch.compile(model, mode=compile_mode)
+    else:
+        print("torch.compile disabled for this run")
+        compiled_model = model
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.learning_rate)
-    use_amp: bool = DEVICE.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    # ------------------------------------------------------------
+    # Optimizer — fused AdamW
+    # ------------------------------------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=train_config.learning_rate,
+        fused=True,
+    )
 
     seq_len: int = train_config.context_length
-    batch_tokens: int = train_config.batch_size  # total tokens per optimizer step
-    micro_tokens: int = train_config.micro_batch_size  # tokens per forward pass
+    batch_tokens: int = train_config.batch_size
+    micro_tokens: int = train_config.micro_batch_size
     accum_steps: int = max(1, batch_tokens // micro_tokens)
+    grad_scale: float = 1.0 / accum_steps
 
-    # Open the shard stream
+    # ------------------------------------------------------------
+    # Pre-load ALL training data into pinned RAM
+    # ------------------------------------------------------------
     shard_pattern: str = os.path.join(train_config.data_path, "fineweb_train_*.bin")
-    stream = TokenStream(shard_pattern)
+    all_tokens: torch.Tensor = preload_train_tokens(shard_pattern)
+    token_cursor: int = 0
+    total_available: int = all_tokens.numel()
 
-    # Calculate steps: train_tokens / batch_tokens * epochs
+    # ------------------------------------------------------------
+    # Training schedule
+    # ------------------------------------------------------------
     steps_per_epoch: int = max(1, train_config.train_tokens // batch_tokens)
     total_steps: int = steps_per_epoch * train_config.epochs
 
-    # DEV_MODE: cap at 100 steps for fast validation
     if dev_mode:
         total_steps = min(total_steps, 100)
         steps_per_epoch = min(steps_per_epoch, 100)
         print("*** DEV_MODE: capped at 100 steps ***")
 
     log_interval: int = 10 if dev_mode else 50
-
-    # LR Scheduler: Warmup 5% + Cosine Decay
-    warmup_steps: int = max(1, int(total_steps * 0.05))
+    lr_warmup_steps: int = max(1, int(total_steps * 0.05))
 
     def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return step / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        if step < lr_warmup_steps:
+            return step / lr_warmup_steps
+        progress = (step - lr_warmup_steps) / max(1, total_steps - lr_warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # ------------------------------------------------------------
+    # Compiler warmup: run N throwaway steps, then reset state
+    # ------------------------------------------------------------
+    warmup_steps_count = 0 if dev_mode or not compile_enabled else int(os.environ.get("COMPILE_WARMUP_STEPS", str(DEFAULT_COMPILE_WARMUP_STEPS)))
+    if warmup_steps_count > 0:
+        print(f"Running {warmup_steps_count} compiler warmup steps (state will be reset)...")
+        initial_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        initial_optimizer_state = copy.deepcopy(optimizer.state_dict())
+
+        for _ in range(warmup_steps_count):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(accum_steps):
+                need = micro_tokens + 1
+                chunk, token_cursor = _next_chunk(all_tokens, token_cursor, need, total_available)
+                x = chunk[:-1].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64, non_blocking=True)
+                y = chunk[1:].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64, non_blocking=True)
+                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
+                    loss = compiled_model(x, y)
+                (loss * grad_scale).backward()
+            optimizer.step()
+
+        # Reset to true initial state — timer starts here
+        model.load_state_dict(initial_model_state, strict=True)
+        optimizer.load_state_dict(initial_optimizer_state)
+        optimizer.zero_grad(set_to_none=True)
+        token_cursor = 0
+        torch.cuda.synchronize()
+        print("Warmup complete. Weights reset to init. Starting real training...")
+
     print(f"--- Starting La Pulga Training Loop on {DEVICE} ---")
     print(f"    Batch tokens: {batch_tokens:,} | Micro tokens: {micro_tokens:,} | Accum steps: {accum_steps}")
     print(f"    Seq len: {seq_len} | Steps/epoch: {steps_per_epoch} | Total steps: {total_steps}")
-    print(f"    LR: {train_config.learning_rate} | Warmup: {warmup_steps} steps | Log every {log_interval} steps")
+    print(f"    LR: {train_config.learning_rate} | LR warmup: {lr_warmup_steps} steps | Log every {log_interval} steps")
+    print(f"    torch.compile: {'enabled' if compile_enabled else 'disabled'} | mode={compile_mode}")
 
+    # ------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------
+    torch.cuda.synchronize()
     for epoch in range(train_config.epochs):
         epoch_loss: float = 0.0
 
         for step in range(steps_per_epoch):
-            global_step: int = epoch * steps_per_epoch + step
             t0: float = time.perf_counter()
 
             optimizer.zero_grad(set_to_none=True)
-            step_loss: float = 0.0
+            step_loss = torch.zeros((), device=DEVICE)
 
-            for micro_step in range(accum_steps):
-                # Read a micro-batch of tokens and build (x, y) pairs
-                chunk = stream.take(micro_tokens + 1)
-                x = chunk[:-1].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64)
-                y = chunk[1:].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64)
+            for _ in range(accum_steps):
+                need = micro_tokens + 1
+                chunk, token_cursor = _next_chunk(all_tokens, token_cursor, need, total_available)
+                x = chunk[:-1].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64, non_blocking=True)
+                y = chunk[1:].reshape(-1, seq_len).to(device=DEVICE, dtype=torch.int64, non_blocking=True)
 
-                with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
-                    loss_val = compiled_model(x, y)
-                    loss_val = loss_val / accum_steps  # scale for accumulation
+                with torch.autocast(device_type=DEVICE.type, dtype=torch.bfloat16):
+                    loss = compiled_model(x, y)
 
-                scaler.scale(loss_val).backward()
-                step_loss += loss_val.item()
+                step_loss += loss.detach()
+                (loss * grad_scale).backward()
 
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
 
+            # Single GPU→CPU sync per step
+            step_loss_float: float = (step_loss / accum_steps).item()
             t1: float = time.perf_counter()
-            epoch_loss += step_loss
+            epoch_loss += step_loss_float
 
             if step % log_interval == 0:
-                bpb_est: float = step_loss / math.log(2)
+                bpb_est: float = step_loss_float / math.log(2)
                 lr_now: float = scheduler.get_last_lr()[0]
-                print(f"Epoch {epoch} | Step {step:04d}/{steps_per_epoch} | "
-                      f"Loss {step_loss:.4f} | BPB ~{bpb_est:.4f} | "
-                      f"LR {lr_now:.2e} | Time {t1-t0:.4f}s")
+                print(
+                    f"Epoch {epoch} | Step {step:04d}/{steps_per_epoch} | "
+                    f"Loss {step_loss_float:.4f} | BPB ~{bpb_est:.4f} | "
+                    f"LR {lr_now:.2e} | Time {t1-t0:.4f}s"
+                )
 
         avg_epoch_loss: float = epoch_loss / steps_per_epoch
         print(f"--- Epoch {epoch} complete | Avg Loss: {avg_epoch_loss:.4f} ---")
 
-    orig_model = getattr(model, '_orig_mod', model)
+    # ------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------
+    orig_model = getattr(model, "_orig_mod", model)
     raw_state_dict = orig_model.state_dict()
 
-    # Primary checkpoint: safetensors (safe, portable, no pickle)
     print("--- Saving Checkpoint (.safetensors) ---")
     cpu_state_dict = {k: v.cpu().contiguous() for k, v in raw_state_dict.items()}
     safetensors_save(cpu_state_dict, train_config.checkpoint_path)
     print(f"Checkpoint saved to {train_config.checkpoint_path}")
 
-    # Submission artifact: int8 quantization + zlib compression (official format)
     print("--- Building Submission Artifact (int8 + zlib) ---")
     obj, stats = quantize_state_dict_int8(raw_state_dict)
     buf = io.BytesIO()
@@ -911,14 +1019,6 @@ def main() -> None:
     num_params: int = sum(p.numel() for p in model.parameters())
     print(f"Model Parameters: {num_params:,}")
     print(f"Device: {DEVICE}")
-
-    # torch.compile: disable max_autotune to avoid Triton shared-memory OOM
-    # on RTX 3090 (fused RMSNorm backward exceeds 101376 byte L1 cache limit)
-    if DEVICE.type == "cuda":
-        import torch._inductor.config as inductor_cfg
-        inductor_cfg.max_autotune = False
-        model = torch.compile(model)
-        print("torch.compile enabled (max_autotune=False)")
 
     # 3. Load SentencePiece tokenizer + BPB lookup tables
     sp = load_sentencepiece(train_config.tokenizer_path)

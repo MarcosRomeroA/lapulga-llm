@@ -1,7 +1,7 @@
 """
 Spec Compliance Test Suite for lapulga-llm.
 Parses SPEC.md and validates the instantiated model against every architectural constraint.
-Run with: uv run pytest tests/test_spec_compliance.py -v
+Run with: python -m unittest tests.test_spec_compliance -v
 """
 import io
 import math

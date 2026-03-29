@@ -73,8 +73,8 @@ SwiGLU uses 3 matrices per MLP layer (w1, w2, w3 with SiLU gate). At dim=512 wit
 All architectural decisions are encoded in **`SPEC.md`**, which serves as the machine-readable single source of truth. The compliance gate is enforced via:
 
 ```bash
-uv run pytest tests/test_spec_compliance.py -v
-uv run pytest tests/test_official_scoring.py -v
+python -m unittest tests.test_spec_compliance -v
+python -m unittest tests.test_official_scoring -v
 ```
 
 ### Gate Rules — No PR or code change that touches `src/model/` or `src/domain/config.py` is accepted unless ALL pass:

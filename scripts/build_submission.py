@@ -5,7 +5,7 @@ Concatenates all modular source files into a single standalone train_gpt.py
 as required by the OpenAI Parameter-Golf competition rules.
 
 Usage:
-    uv run scripts/build_submission.py
+    python scripts/build_submission.py
     # Output: records/lapulga-llm/train_gpt.py
 """
 import ast

@@ -1,7 +1,7 @@
 """
 Official Scoring Mock Tests for lapulga-llm.
 Simulates the Parameter-Golf evaluation pipeline using synthetic data.
-Run with: uv run pytest tests/test_official_scoring.py -v
+Run with: python -m unittest tests.test_official_scoring -v
 """
 import io
 import math

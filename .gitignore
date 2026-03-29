@@ -28,3 +28,7 @@ val.txt
 
 # Logs
 /*.log
+
+*.log
+records/**/*.log
+runpodctl.tar.gz

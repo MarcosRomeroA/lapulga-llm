@@ -10,25 +10,26 @@ Train the best language model that fits in a **16MB artifact** in under **10 min
 
 ---
 
-## 🧠 Architecture Setup (v0.1 - Baseline)
+## 🧠 Architecture Setup (v4.2 - H100 Candidate)
 
-To respect the **16MB boundary**, *La Pulga LLM* relies on an extremely compact parameter budget. The current baseline design targets **~7.8M parameters** (stored in `FP16` precision), totaling exactly **~15.6 MB** on disk.
+To respect the **16MB boundary**, *La Pulga LLM* now targets a **shared-weights ALBERT-style architecture with 14,959,152 stored parameters** and int8+zlib export. Effective depth is preserved through 4 physical layers repeated 3 times (12 effective transformer steps).
 
 | Hyperparameter | Value | Description |
 | :--- | :--- | :--- |
-| **Vocab Size (V)** | `8,192` | Extremely restricted to avoid embedding matrix bloat. |
-| **Dim (D)** | `256` | Core hidden dimension. |
-| **Layers (L)** | `6` | Transformer depth (Attention + MLP). |
-| **Attention Heads** | `8` | 32 dimensions per head. |
-| **KV Heads (GQA)** | `2` | Grouped-Query Attention to share K&V weights, saving massive space. |
-| **MLP Hidden** | `1024` | Feed-Forward expansion space (SwiGLU). |
+| **Vocab Size (V)** | `1,024` | Official SentencePiece sp1024 vocabulary for challenge compatibility. |
+| **Dim (D)** | `768` | Core hidden dimension aligned with H100 optimization targets. |
+| **Physical Layers** | `4` | Unique parameterized blocks stored on disk. |
+| **Repeat Count** | `3` | ALBERT-style reuse for 12 effective transformer steps. |
+| **Attention Heads** | `12` | 64 dimensions per head. |
+| **KV Heads (GQA)** | `4` | Grouped-Query Attention to share K&V weights. |
+| **MLP Hidden** | `1280` | ReLU² feed-forward width tuned to stay below 16,000,000-byte artifact limit. |
 
 ## ⚡ Tech Stack & Optimizations
 
 *   **Apple Silicon (M4):** Local prototyping is completely driven by [Apple's MLX Framework](https://github.com/ml-explore/mlx). We write training loops in Python taking advantage of the unified memory for ultra-fast local iteration batches.
 *   **Runpod (8xH100):** Cloud instances will leverage **PyTorch**, **FlashAttention-2** and potentially **Unsloth** wrappers to squeeze every microsecond out of the 10-minute training wall.
 *   **Weight Tying:** The model explicitly ties the Unembedding matrix weights back to the Input Embeddings, recovering nearly `~2M` parameters instantly.
-*   **Checkpointing:** We dump raw bytes using `.safetensors` on every epoch validation to ensure no hidden overhead breaches max capacity.
+*   **Checkpointing + Export:** We save `.safetensors` and emit official int8+zlib artifacts for strict 16,000,000-byte validation.
 
 ## 📂 Project Structure
 

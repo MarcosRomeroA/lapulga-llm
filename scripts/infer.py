@@ -3,8 +3,8 @@ Inference script for La Pulga.
 Loads a saved int8+zlib checkpoint and generates text from a prompt.
 
 Usage:
-    uv run scripts/infer.py --prompt "Once upon a time"
-    uv run scripts/infer.py --prompt "The cat" --max-tokens 100 --temperature 0.9
+    python scripts/infer.py --prompt "Once upon a time"
+    python scripts/infer.py --prompt "The cat" --max-tokens 100 --temperature 0.9
 """
 import argparse
 import io

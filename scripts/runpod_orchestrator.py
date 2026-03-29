@@ -129,7 +129,10 @@ REMOTE = f"root@{ssh_ip}"
 
 try:
     # ---- Upload training script ----
-    script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "train_gpt.py")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script_path = os.path.join(project_root, "records", "lapulga-llm", "train_gpt.py")
+    if not os.path.exists(script_path):
+        subprocess.run(["python", os.path.join(project_root, "scripts", "build_submission.py")], check=True)
     log(f"Uploading local script to remote: {script_path}")
     subprocess.run(
         ["scp"] + ["-i", SSH_KEY, "-P", str(ssh_port), "-o", "StrictHostKeyChecking=no"] + [

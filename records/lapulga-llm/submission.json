@@ -1,0 +1,10 @@
+{
+  "submission_name": "lapulga-llm",
+  "author": "marcos",
+  "github": "marcos",
+  "track": "track_10min_16mb",
+  "val_bpb": null,
+  "artifact_bytes": 15214826,
+  "training_time_seconds": null,
+  "notes": "Fill val_bpb/training_time_seconds from official 8xH100 run logs."
+}

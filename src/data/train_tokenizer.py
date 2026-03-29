@@ -4,7 +4,7 @@ Trains a custom 8192-token BPE tokenizer on TinyStories,
 so La Pulga can understand every word without truncation.
 
 Usage:
-    uv run src/data/train_tokenizer.py
+    python src/data/train_tokenizer.py
 """
 from datasets import load_dataset
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders

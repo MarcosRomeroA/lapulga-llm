@@ -31,14 +31,6 @@ def main() -> None:
     print(f"Model Parameters: {num_params:,}")
     print(f"Device: {DEVICE}")
 
-    # torch.compile: disable max_autotune to avoid Triton shared-memory OOM
-    # on RTX 3090 (fused RMSNorm backward exceeds 101376 byte L1 cache limit)
-    if DEVICE.type == "cuda":
-        import torch._inductor.config as inductor_cfg
-        inductor_cfg.max_autotune = False
-        model = torch.compile(model)
-        print("torch.compile enabled (max_autotune=False)")
-
     # 3. Load SentencePiece tokenizer + BPB lookup tables
     sp = load_sentencepiece(train_config.tokenizer_path)
     print(f"SentencePiece tokenizer loaded: {sp.vocab_size()} tokens")

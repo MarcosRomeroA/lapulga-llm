@@ -19,19 +19,14 @@ import zlib
 
 import torch
 import torch.nn.functional as F
-from torch.backends.cuda import (
-    enable_cudnn_sdp,
-    enable_flash_sdp,
-    enable_math_sdp,
-    enable_mem_efficient_sdp,
-)
+from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 from safetensors.torch import save_file as safetensors_save
 from src.domain.config import TrainingConfig
 from src.model.transformer import LanguageModel, CastedLinear, DEVICE
 from src.data.loader import preload_train_tokens
 from src.utils.quantize import quantize_state_dict_int8
 
-_COMPILE_WARMUP_STEPS: int = 20
+DEFAULT_COMPILE_WARMUP_STEPS: int = 8
 
 
 def _next_chunk(
@@ -82,8 +77,14 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
 
     model.train()
 
-    print("Compiling model (torch.compile)...")
-    compiled_model = torch.compile(model)
+    compile_enabled: bool = os.environ.get("COMPILE_MODEL", "1") == "1" and DEVICE.type == "cuda"
+    compile_mode: str = os.environ.get("TORCH_COMPILE_MODE", "default")
+    if compile_enabled:
+        print(f"Compiling model (torch.compile, mode={compile_mode})...")
+        compiled_model = torch.compile(model, mode=compile_mode)
+    else:
+        print("torch.compile disabled for this run")
+        compiled_model = model
 
     # ------------------------------------------------------------
     # Optimizer — fused AdamW
@@ -133,7 +134,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     # ------------------------------------------------------------
     # Compiler warmup: run N throwaway steps, then reset state
     # ------------------------------------------------------------
-    warmup_steps_count = 0 if dev_mode else _COMPILE_WARMUP_STEPS
+    warmup_steps_count = 0 if dev_mode or not compile_enabled else int(os.environ.get("COMPILE_WARMUP_STEPS", str(DEFAULT_COMPILE_WARMUP_STEPS)))
     if warmup_steps_count > 0:
         print(f"Running {warmup_steps_count} compiler warmup steps (state will be reset)...")
         initial_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -163,7 +164,7 @@ def execute_training(model: LanguageModel, train_config: TrainingConfig) -> None
     print(f"    Batch tokens: {batch_tokens:,} | Micro tokens: {micro_tokens:,} | Accum steps: {accum_steps}")
     print(f"    Seq len: {seq_len} | Steps/epoch: {steps_per_epoch} | Total steps: {total_steps}")
     print(f"    LR: {train_config.learning_rate} | LR warmup: {lr_warmup_steps} steps | Log every {log_interval} steps")
-    print(f"    torch.compile: max-autotune")
+    print(f"    torch.compile: {'enabled' if compile_enabled else 'disabled'} | mode={compile_mode}")
 
     # ------------------------------------------------------------
     # Main training loop

@@ -104,12 +104,23 @@ class Attention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.n_kv_heads != self.n_heads),
-        )
+        try:
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.n_kv_heads != self.n_heads),
+            )
+        except TypeError:
+            if self.n_kv_heads != self.n_heads:
+                repeat_factor = self.n_heads // self.n_kv_heads
+                k = k.repeat_interleave(repeat_factor, dim=1)
+                v = v.repeat_interleave(repeat_factor, dim=1)
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=True,
+            )
         output = output.transpose(1, 2).contiguous().reshape(batch_size, seq_length, -1)
         return self.wo(output)
 
