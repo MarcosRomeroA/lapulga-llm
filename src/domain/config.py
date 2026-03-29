@@ -14,7 +14,7 @@ class ModelConfig:
     repeat_count: int = 1
     n_heads: int = 8
     n_kv_heads: int = 4
-    hidden_dim: int = 1536
+    hidden_dim: int = 1344
     n_banks: int = 4  # Parameter banking experts
     vocab_size: int = 1024
     norm_eps: float = 1e-5
