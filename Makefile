@@ -37,7 +37,7 @@ download-data:
 
 ## Start RunPod, train, download artifacts, stop Pod (zero-click)
 run-cloud:
-	@PYTHONUNBUFFERED=1 python scripts/runpod_orchestrator.py
+	@PYTHONUNBUFFERED=1 uv run scripts/runpod_orchestrator.py
 
 ## Show available commands
 help:
